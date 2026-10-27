@@ -4,16 +4,25 @@
 //! `GET /tailscale/status`):
 //! 1. Detect: is `tailscale` on PATH, or at the standard install location?
 //! 2. If missing: download the official stable MSI and install it with
-//!    `msiexec`. This raises one Windows admin/UAC prompt — the UI says so.
-//!    The latest stable version is resolved from
-//!    `https://pkgs.tailscale.com/stable/VERSION`, then the MSI is
+//!    `msiexec` via an elevated PowerShell launch. This raises one Windows
+//!    admin/UAC prompt — the UI says so. The latest stable version is
+//!    resolved from the stable package listing at
+//!    `https://pkgs.tailscale.com/stable/` (its version dropdown's first
+//!    versioned entry is the latest release); the MSI is then
 //!    `https://pkgs.tailscale.com/stable/tailscale-setup-{version}-amd64.msi`
-//!    (the documented stable MSI pattern).
+//!    (the documented stable MSI pattern, verified live).
+//!    NOTE: there is NO `VERSION` file on the stable track — v0.1.0
+//!    resolved versions from a `VERSION` URL that 404s, so a blank-version
+//!    install died before any download started. That is fixed here.
 //! 3. Login (one-time, by the owner): `tailscale up` opens the browser SSO
 //!    flow, or `tailscale up --authkey <key>` uses a key pasted from the
 //!    Tailscale admin console. After that the connection is headless.
 //! 4. The engine then binds its listener to the Tailscale IPv4 address
 //!    (`tailscale ip -4`), never to a public interface.
+//!
+//! Every helper process here runs HIDDEN (CREATE_NO_WINDOW on Windows):
+//! without it, each console helper flashes a blank console window on the
+//! owner's screen — the exact symptom reported for "Install Tailscale".
 //!
 //! Nothing here phones home to anyone except Tailscale itself (the
 //! transport the owner chose). Auth keys are passed to the local
@@ -22,7 +31,29 @@
 use std::path::PathBuf;
 use std::process::Command;
 
-pub const VERSION_URL: &str = "https://pkgs.tailscale.com/stable/VERSION";
+/// Stable package listing page (used for latest-version resolution).
+pub const LISTING_URL: &str = "https://pkgs.tailscale.com/stable/";
+
+/// Spawn a helper process with no visible console window on Windows.
+/// Without CREATE_NO_WINDOW, a console helper spawned from a windowless
+/// parent gets a brand-new console window flashed on screen.
+#[cfg(windows)]
+fn hidden_command(program: &str) -> Command {
+    use std::os::windows::process::CommandExt;
+    let mut c = Command::new(program);
+    c.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    c
+}
+
+#[cfg(not(windows))]
+fn hidden_command(program: &str) -> Command {
+    Command::new(program)
+}
+
+/// Single-quote a string for PowerShell, doubling embedded quotes.
+fn ps_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "''"))
+}
 
 /// MSI URL for a resolved stable version.
 pub fn msi_url(version: &str) -> String {
@@ -46,7 +77,7 @@ pub fn default_cli_path() -> PathBuf {
 
 /// Locate the `tailscale` binary: PATH first, then the standard location.
 pub fn find_cli() -> Option<PathBuf> {
-    if let Ok(out) = Command::new("tailscale").arg("version").output() {
+    if let Ok(out) = hidden_command("tailscale").arg("version").output() {
         if out.status.success() {
             return Some(PathBuf::from("tailscale"));
         }
@@ -66,7 +97,7 @@ pub fn find_cli() -> Option<PathBuf> {
 }
 
 fn run_cli(cli: &PathBuf, args: &[&str]) -> Result<String, String> {
-    let out = Command::new(cli)
+    let out = hidden_command(&cli.to_string_lossy())
         .args(args)
         .output()
         .map_err(|e| format!("cannot run tailscale: {}", e))?;
@@ -110,11 +141,90 @@ pub fn status() -> TsStatus {
     }
 }
 
-/// Install Tailscale on Windows: download the stable MSI via PowerShell
-/// and run it with msiexec. Returns an error on non-Windows (the engine's
-/// Windows installer flow is the real path; dev machines use their own
-/// package manager).
-pub fn install_windows(version: &str) -> Result<(), String> {
+fn is_version(s: &str) -> bool {
+    let parts: Vec<&str> = s.split('.').collect();
+    parts.len() == 3
+        && parts
+            .iter()
+            .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
+}
+
+/// Extract the latest stable version from the pkgs listing HTML: the
+/// version dropdown's first versioned `<option value="x.y.z">` is the
+/// latest release (the very first option is literally "latest" and is
+/// skipped). Pure function, unit-tested.
+pub fn parse_stable_version_from_listing(html: &str) -> Option<String> {
+    let bytes = html.as_bytes();
+    let mut i = 0;
+    while i + 13 <= bytes.len() {
+        if &html[i..i + 13] == "option value=" {
+            let mut j = i + 13;
+            while j < bytes.len()
+                && (bytes[j] == b' '
+                    || bytes[j] == b'='
+                    || bytes[j] == b'"'
+                    || bytes[j] == b'\'')
+            {
+                j += 1;
+            }
+            let start = j;
+            while j < bytes.len()
+                && bytes[j] != b'"'
+                && bytes[j] != b'\''
+                && bytes[j] != b' '
+                && bytes[j] != b'>'
+            {
+                j += 1;
+            }
+            let value = &html[start..j];
+            if is_version(value) {
+                return Some(value.to_string());
+            }
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+    None
+}
+
+/// Resolve the latest stable version from the package listing (Windows
+/// only; hidden PowerShell fetch). Returns None on any fetch/parse
+/// failure — callers must then ask the owner for an explicit version
+/// instead of failing silently.
+pub fn resolve_stable_version() -> Option<String> {
+    #[cfg(not(windows))]
+    {
+        return None;
+    }
+    #[cfg(windows)]
+    {
+        let out = hidden_command("powershell")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                &format!(
+                    "(Invoke-WebRequest -Uri {} -UseBasicParsing).Content",
+                    ps_quote(LISTING_URL)
+                ),
+            ])
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let html = String::from_utf8_lossy(&out.stdout);
+        parse_stable_version_from_listing(&html)
+    }
+}
+
+/// Install Tailscale on Windows: download the stable MSI via hidden
+/// PowerShell and install it elevated. Returns the VERIFIED installed
+/// version (from `tailscale version` after install), or a specific error.
+/// Returns an error on non-Windows (the engine's Windows installer flow
+/// is the real path; dev machines use their own package manager).
+pub fn install_windows(version: &str) -> Result<String, String> {
     #[cfg(not(windows))]
     {
         let _ = version;
@@ -125,14 +235,18 @@ pub fn install_windows(version: &str) -> Result<(), String> {
         let url = msi_url(version);
         let msi = std::env::temp_dir().join("understudy-tailscale-setup.msi");
         let msi_arg = msi.to_string_lossy().into_owned();
-        // Download with PowerShell (present on every supported Windows).
-        let dl = Command::new("powershell")
+        // Download hidden, with -UseBasicParsing: without it, Windows
+        // PowerShell falls back to the IE engine, which fails outright on
+        // systems where IE is disabled — a fast, silent failure.
+        let dl = hidden_command("powershell")
             .args([
                 "-NoProfile",
+                "-NonInteractive",
                 "-Command",
                 &format!(
-                    "Invoke-WebRequest -Uri '{}' -OutFile '{}'",
-                    url, msi_arg
+                    "Invoke-WebRequest -Uri {} -OutFile {} -UseBasicParsing",
+                    ps_quote(&url),
+                    ps_quote(&msi_arg)
                 ),
             ])
             .output()
@@ -140,18 +254,75 @@ pub fn install_windows(version: &str) -> Result<(), String> {
         if !dl.status.success() {
             return Err(format!(
                 "Tailscale MSI download failed: {}",
-                String::from_utf8_lossy(&dl.stderr)
+                String::from_utf8_lossy(&dl.stderr).trim()
             ));
         }
-        // msiexec /i raises the UAC prompt (admin install). /qb = basic UI.
-        let inst = Command::new("msiexec")
-            .args(["/i", &msi_arg, "/qb"])
-            .output()
-            .map_err(|e| format!("msiexec failed: {}", e))?;
-        if !inst.status.success() {
-            return Err("Tailscale MSI install failed (did you decline the admin prompt?)".to_string());
+        // The download must be a real MSI (~35 MB), not an error page.
+        let size = std::fs::metadata(&msi).map(|m| m.len()).unwrap_or(0);
+        if size < 1_000_000 {
+            return Err(format!(
+                "Tailscale MSI download looks wrong ({} bytes, expected tens of MB); check your connection and try again",
+                size
+            ));
         }
-        Ok(())
+        // Install elevated: Start-Process -Verb RunAs raises the one UAC
+        // prompt, -Wait blocks until msiexec finishes, and the exit code
+        // is reported. A declined prompt makes Start-Process throw.
+        // /qb = basic progress UI (not a console window).
+        let script = format!(
+            "$p = Start-Process -FilePath 'msiexec.exe' -ArgumentList '/i',{},'/qb' -Verb RunAs -Wait -PassThru; $p.ExitCode",
+            ps_quote(&msi_arg)
+        );
+        let inst = hidden_command("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+            .output()
+            .map_err(|e| format!("install failed: {}", e))?;
+        if !inst.status.success() {
+            let err = String::from_utf8_lossy(&inst.stderr);
+            if err.contains("canceled")
+                || err.contains("cancelled")
+                || err.contains("1223")
+            {
+                return Err(
+                    "Tailscale install cancelled — the admin prompt was declined"
+                        .to_string(),
+                );
+            }
+            return Err(format!(
+                "Tailscale install failed to start: {}",
+                err.trim()
+            ));
+        }
+        let code: i32 = String::from_utf8_lossy(&inst.stdout)
+            .trim()
+            .parse()
+            .unwrap_or(-1);
+        if code != 0 && code != 3010 {
+            return Err(format!(
+                "Tailscale installer exited with code {} (0 = success, 3010 = success, reboot needed)",
+                code
+            ));
+        }
+        // Verify: the CLI must now exist and answer. Success is never
+        // claimed on the installer's exit code alone.
+        match find_cli() {
+            Some(cli) => match run_cli(&cli, &["version"]) {
+                Ok(v) => Ok(v
+                    .lines()
+                    .next()
+                    .unwrap_or(version)
+                    .trim()
+                    .to_string()),
+                Err(_) => Err(
+                    "installer finished but tailscale.exe does not answer yet — try again in a moment"
+                        .to_string(),
+                ),
+            },
+            None => Err(
+                "installer finished but tailscale.exe was not found — the install may need a retry"
+                    .to_string(),
+            ),
+        }
     }
 }
 
@@ -183,6 +354,40 @@ mod tests {
         assert_eq!(
             msi_url(" 1.88.4\n"),
             "https://pkgs.tailscale.com/stable/tailscale-setup-1.88.4-amd64.msi"
+        );
+    }
+
+    #[test]
+    fn listing_parser_finds_latest_version() {
+        // Snippet shaped like the real stable listing's version dropdown.
+        let html = r#"<select name="v" id="v">
+    <option value="latest" selected>latest</option>
+    <option value="1.104.2" >1.104.2</option>
+    <option value="1.104.1" >1.104.1</option>
+    <option value="1.102.5" >1.102.5</option>
+  </select>"#;
+        assert_eq!(
+            parse_stable_version_from_listing(html).as_deref(),
+            Some("1.104.2")
+        );
+    }
+
+    #[test]
+    fn listing_parser_returns_none_without_versions() {
+        assert_eq!(parse_stable_version_from_listing("<html>no options</html>"), None);
+        assert_eq!(
+            parse_stable_version_from_listing(r#"<option value="latest">latest</option>"#),
+            None
+        );
+    }
+
+    #[test]
+    fn listing_parser_rejects_non_versions() {
+        // A "1.2" two-part value is not a full version; keep scanning.
+        let html = r#"<option value="1.2">1.2</option><option value="1.104.2">1.104.2</option>"#;
+        assert_eq!(
+            parse_stable_version_from_listing(html).as_deref(),
+            Some("1.104.2")
         );
     }
 

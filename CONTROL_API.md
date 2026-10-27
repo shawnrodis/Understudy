@@ -1,4 +1,4 @@
-# Understudy Control API — contract (v0.1.0)
+# Understudy Control API — contract (v0.1.1)
 
 This document is the complete contract for operating an Understudy-controlled
 PC. It is written so that a future Muse session can operate the PC through
@@ -20,11 +20,14 @@ Authorization: Bearer <token>
 
 - The token is generated on the controlled PC on first engine run and stored
   at `%APPDATA%\Understudy\auth.token` (Linux dev path: `~/.understudy/`).
-- It is printed once to the engine's stdout on first run. The owner copies it
-  into the controller once. The Flutter app's Status screen can reveal it
-  again later (same user, same machine).
+- It is stored at `%APPDATA%\Understudy\auth.token` on first run. The
+  owner copies it into the controller once. The Flutter app's Status
+  screen can reveal it again later (same user, same machine).
 - Missing or wrong token → `401 {"ok":false,"error":"missing or invalid bearer token"}`
   and the attempt is appended to the action log.
+- The token can be rotated at any time with `POST /auth/rotate` (below):
+  the old token dies immediately, and the new one is re-read from
+  `auth.token` — it is never returned in an API response.
 - Never put the token in a URL, a repo, a screenshot, or a log message.
 
 ## Response envelope
@@ -236,12 +239,18 @@ was supplied); tokens and file contents are never logged.
 {"version": "1.88.4"}
 ```
 
-Downloads the official stable MSI for that version and installs it with
-`msiexec` (one Windows admin prompt). `version` may be omitted or empty:
-the engine then resolves the latest stable version from
-`https://pkgs.tailscale.com/stable/VERSION` (Windows only). On non-Windows
-hosts this endpoint returns 501 — install Tailscale with the host's package
-manager instead.
+Downloads the official stable MSI for that version and installs it
+elevated (one Windows admin prompt, via an elevated installer launch —
+no console window is ever shown). `version` may be omitted or empty:
+the engine then resolves the latest stable version from the stable
+package listing at `https://pkgs.tailscale.com/stable/` (its version
+dropdown's first versioned entry is the latest release — there is no
+`VERSION` file on that track). Success is only reported after the
+install is verified (`tailscale.exe` present and answering
+`tailscale version`); the response carries the verified version.
+On non-Windows hosts this endpoint returns 501 — install Tailscale with
+the host's package manager instead. If automatic version resolution
+fails, the error says so plainly and asks for an explicit version.
 
 ### POST /tailscale/login
 
@@ -254,6 +263,22 @@ manager instead.
   the browser SSO flow for the owner to complete once.
 - The key is passed only to the local `tailscale` binary and is never
   logged. Response: `{"ok":true,"login_started":true}`.
+
+### POST /auth/rotate
+
+```json
+{}
+```
+
+Generates a fresh bearer token, stores it atomically in `auth.token`,
+and swaps the engine's live token to it in the same step. The old token
+is invalid from that moment — any controller still holding it gets 401s
+until it re-pairs. The new token is deliberately NOT returned in the
+response: the Flutter UI re-reads `auth.token` from the data dir (same
+user, same machine) and shows it in the token-reveal field. Use this the
+moment a token may have leaked. Response:
+`{"ok":true,"rotated":true}`. The rotation itself is action-logged
+(without any token value).
 
 ### POST /shutdown
 
@@ -274,9 +299,10 @@ may close as the server stops).
 - A screenshot on a non-Windows host → 501 (capture is a Windows
   capability; the endpoint contract is unchanged).
 - Malformed JSON or missing required fields → 400 naming the field.
-- Any 401 response means the token is missing, wrong, or stale (a new token
-  is generated only if `auth.token` was deleted — in that case the owner
-  must re-pair by copying the new first-run token).
+- Any 401 response means the token is missing, wrong, or stale (a token
+  goes stale when it is rotated via `POST /auth/rotate`, or when
+  `auth.token` was deleted and a new first-run token generated — in both
+  cases the owner must re-pair by copying the current token).
 
 ## Operating notes for the AI operator
 

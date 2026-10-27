@@ -26,12 +26,15 @@ use crate::auth::{bearer_token, tokens_equal};
 use crate::json::{self, quote, Value};
 use crate::{capture, cmd, files, input, log, monitors, process, tailscale};
 
-pub const VERSION: &str = "0.1.0";
+pub const VERSION: &str = "0.1.1";
 
 /// Shared server state.
 pub struct State {
     pub data_dir: PathBuf,
-    pub token: String,
+    /// The live bearer token. Behind a lock so `POST /auth/rotate` can
+    /// swap it while requests are in flight; the old value dies the
+    /// moment the swap lands.
+    pub token: std::sync::RwLock<String>,
     pub file_roots: Vec<PathBuf>,
     pub shutdown: AtomicBool,
     pub requests: AtomicU64,
@@ -43,7 +46,7 @@ impl State {
     pub fn new(data_dir: PathBuf, token: String, file_roots: Vec<PathBuf>) -> State {
         State {
             data_dir,
-            token,
+            token: std::sync::RwLock::new(token),
             file_roots,
             shutdown: AtomicBool::new(false),
             requests: AtomicU64::new(0),
@@ -501,7 +504,7 @@ fn route(state: &Arc<State>, req: &Request) -> Response {
                     None => {
                         return err(
                             400,
-                            "could not resolve the latest Tailscale version; pass {\"version\": \"x.y.z\"}",
+                            "could not determine the latest Tailscale version automatically; type a version number explicitly (or check your connection)",
                         )
                     }
                 }
@@ -509,8 +512,8 @@ fn route(state: &Arc<State>, req: &Request) -> Response {
                 version
             };
             match tailscale::install_windows(&version) {
-                Ok(()) => ok_json(&format!("\"installed_version\":{}", quote(&version))),
-                Err(e) => err(501, &e),
+                Ok(verified) => ok_json(&format!("\"installed_version\":{}", quote(&verified))),
+                Err(e) => err(500, &e),
             }
         }
         ("POST", "/tailscale/login") => {
@@ -523,6 +526,20 @@ fn route(state: &Arc<State>, req: &Request) -> Response {
             let key = body.get("authkey").and_then(Value::as_str);
             match tailscale::login(key) {
                 Ok(()) => ok_json("\"login_started\":true"),
+                Err(e) => err(500, &e),
+            }
+        }
+        ("POST", "/auth/rotate") => {
+            // Rotate the bearer token: the old token dies immediately.
+            // The new token is NEVER returned here; the Flutter UI
+            // re-reads auth.token from the shared data dir.
+            match crate::auth::rotate_token(&state.data_dir) {
+                Ok(new_token) => {
+                    if let Ok(mut live) = state.token.write() {
+                        *live = new_token;
+                    }
+                    ok_json("\"rotated\":true")
+                }
                 Err(e) => err(500, &e),
             }
         }
@@ -541,29 +558,13 @@ fn point_fields(body: &Value) -> Result<(u32, f64, f64), String> {
     Ok((monitor, x, y))
 }
 
-/// Resolve the latest stable Tailscale version via PowerShell on Windows.
-/// Returns None on other platforms or on fetch failure.
+/// Resolve the latest stable Tailscale version (Windows only, via the
+/// package listing — there is no `VERSION` file on the stable track).
+/// Returns None on other platforms or on fetch/parse failure.
 fn fetch_stable_version() -> Option<String> {
     #[cfg(windows)]
     {
-        let out = std::process::Command::new("powershell")
-            .args([
-                "-NoProfile",
-                "-Command",
-                &format!(
-                    "(Invoke-WebRequest -Uri '{}' -UseBasicParsing).Content.Trim()",
-                    tailscale::VERSION_URL
-                ),
-            ])
-            .output()
-            .ok()?;
-        if out.status.success() {
-            let v = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if !v.is_empty() && v.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false) {
-                return Some(v);
-            }
-        }
-        None
+        tailscale::resolve_stable_version()
     }
     #[cfg(not(windows))]
     {
@@ -679,7 +680,13 @@ fn handle_conn(state: Arc<State>, mut stream: TcpStream) {
     let authed = req
         .header("Authorization")
         .and_then(bearer_token)
-        .map(|t| tokens_equal(t, &state.token))
+        .map(|t| {
+            state
+                .token
+                .read()
+                .map(|live| tokens_equal(t, &live))
+                .unwrap_or(false)
+        })
         .unwrap_or(false);
     let resp = if !authed {
         log::append(&state.data_dir, "auth_failed", false, &format!("{} {}", method, path));

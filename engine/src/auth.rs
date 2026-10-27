@@ -77,6 +77,24 @@ pub fn load_or_create(data_dir: &Path) -> Result<(String, bool), String> {
     Ok((token, true))
 }
 
+/// Rotate the bearer token: generate a fresh one, store it atomically
+/// (temp file + rename, so a crash never leaves a half-written token),
+/// and return it. The caller must swap the live in-memory token to the
+/// new value in the same step — from that moment the old token is dead.
+/// The new token is returned to the caller for storage only; it must
+/// never be logged or sent back in an API response (the Flutter UI
+/// re-reads `auth.token` from the data dir, which it shares as the same
+/// user — that is the only re-pair path).
+pub fn rotate_token(data_dir: &Path) -> Result<String, String> {
+    let new_token = generate_token();
+    fs::create_dir_all(data_dir).map_err(|e| format!("cannot create data dir: {}", e))?;
+    let path = data_dir.join("auth.token");
+    let tmp = data_dir.join("auth.token.tmp");
+    fs::write(&tmp, &new_token).map_err(|e| format!("cannot store rotated token: {}", e))?;
+    fs::rename(&tmp, &path).map_err(|e| format!("cannot store rotated token: {}", e))?;
+    Ok(new_token)
+}
+
 /// Constant-ish comparison: compare lengths and bytes without early exit
 /// on the first mismatch (best effort in safe Rust; timing attacks against
 /// a Tailscale-local token are out of scope, but there is no reason to
@@ -119,6 +137,23 @@ mod tests {
         assert_eq!(bearer_token("bearer abc123"), None);
         assert_eq!(bearer_token("Bearer "), None);
         assert_eq!(bearer_token("Basic abc"), None);
+    }
+
+    #[test]
+    fn rotation_replaces_the_stored_token() {
+        let dir = std::env::temp_dir().join(format!(
+            "understudy-rotate-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (old, _) = load_or_create(&dir).expect("create");
+        let new = rotate_token(&dir).expect("rotate");
+        assert_ne!(old, new);
+        assert_eq!(new.len(), 64);
+        let (loaded, was_new) = load_or_create(&dir).expect("reload");
+        assert_eq!(loaded, new);
+        assert!(!was_new);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

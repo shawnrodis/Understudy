@@ -22,11 +22,51 @@ import 'package:window_manager/window_manager.dart';
 
 import 'api_client.dart';
 
+/// Loopback port the single-instance guard listens on. Unrelated to the
+/// engine's control port (18769): this one exists only so a second app
+/// launch can find the first and hand off to it.
+const _singleInstancePort = 18771;
+
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await windowManager.ensureInitialized();
+  await _enforceSingleInstance();
   await windowManager.setPreventClose(true);
   runApp(const UnderstudyApp());
+}
+
+/// Exactly one window, one tray icon, one taskbar button. If another
+/// Understudy window is already running, ask it to show itself and exit
+/// without creating a duplicate window, engine, or taskbar icon. A
+/// crashed previous instance leaves the port free, so a fresh launch
+/// still works.
+Future<void> _enforceSingleInstance() async {
+  try {
+    final probe = await Socket.connect(
+      InternetAddress.loopbackIPv4,
+      _singleInstancePort,
+      timeout: const Duration(milliseconds: 300),
+    );
+    // Any connection wakes the existing instance; no data needed.
+    probe.destroy();
+    exit(0);
+  } catch (_) {
+    // No existing instance listening; fall through and become the one.
+  }
+  try {
+    final server = await ServerSocket.bind(
+      InternetAddress.loopbackIPv4,
+      _singleInstancePort,
+    );
+    server.listen((client) async {
+      client.destroy();
+      await windowManager.show();
+      await windowManager.focus();
+    });
+  } catch (_) {
+    // If the guard port cannot be bound, run anyway rather than brick
+    // the launch; the window still opens, just without the guard.
+  }
 }
 
 class UnderstudyApp extends StatelessWidget {
@@ -175,6 +215,23 @@ class _HomeScreenState extends State<HomeScreen> with WindowListener {
     }
   }
 
+  Future<void> _rotateToken() async {
+    final api = _api;
+    if (api == null) return;
+    try {
+      await api.rotateToken();
+      // The old token is dead now; re-read the fresh one from disk so
+      // this UI (and its reveal field) keeps working.
+      final info = await readEngineInfo();
+      if (info != null) _api = ApiClient(info);
+      setState(() => _notice =
+          'Pairing token rotated — the old token is now invalid.');
+      await _refresh();
+    } catch (e) {
+      setState(() => _notice = 'Token rotation failed: $e');
+    }
+  }
+
   Future<void> _quit() async {
     try {
       await _api?.shutdown();
@@ -227,6 +284,7 @@ class _HomeScreenState extends State<HomeScreen> with WindowListener {
                   tokenRevealed: _tokenRevealed,
                   onReveal: () =>
                       setState(() => _tokenRevealed = !_tokenRevealed),
+                  onRotate: _rotateToken,
                   onQuit: _quit,
                   notice: _notice,
                 ),
@@ -293,6 +351,7 @@ class _StatusTab extends StatelessWidget {
     required this.api,
     required this.tokenRevealed,
     required this.onReveal,
+    required this.onRotate,
     required this.onQuit,
     required this.notice,
   });
@@ -302,6 +361,7 @@ class _StatusTab extends StatelessWidget {
   final ApiClient? api;
   final bool tokenRevealed;
   final VoidCallback onReveal;
+  final VoidCallback onRotate;
   final VoidCallback onQuit;
   final String? notice;
 
@@ -366,6 +426,18 @@ class _StatusTab extends StatelessWidget {
               );
             },
           ),
+        const SizedBox(height: 8),
+        OutlinedButton.icon(
+          onPressed: onRotate,
+          icon: const Icon(Icons.refresh),
+          label: const Text('Rotate pairing token'),
+        ),
+        const Text(
+          'Rotating generates a fresh token and kills the old one '
+          'immediately — use it if a token ever leaks. The new token '
+          'appears above after rotation.',
+          style: TextStyle(color: Colors.grey),
+        ),
         const SizedBox(height: 16),
         FilledButton.icon(
           onPressed: onQuit,
@@ -423,16 +495,30 @@ class _SetupTabState extends State<_SetupTab> {
   final _version = TextEditingController();
   final _authKey = TextEditingController();
   bool _busy = false;
+  String? _setupMessage;
+
+  /// Results show HERE, on the Tailscale tab where the buttons live —
+  /// v0.1.0 only surfaced them as a notice on the Status tab, so an
+  /// install failure looked like nothing happening at all.
+  void _say(String message) {
+    widget.onNotice(message);
+    if (mounted) setState(() => _setupMessage = message);
+  }
 
   Future<void> _install() async {
     final api = widget.api;
     if (api == null) return;
-    setState(() => _busy = true);
+    setState(() {
+      _busy = true;
+      _setupMessage =
+          'Installing… a Windows admin prompt will appear — approve it. '
+          'This runs hidden (no console window) and can take a minute.';
+    });
     try {
       final res = await api.tailscaleInstall(_version.text.trim());
-      widget.onNotice('Tailscale installed: ${res['installed_version']}');
+      _say('Tailscale installed and verified: ${res['installed_version']}');
     } catch (e) {
-      widget.onNotice('Install failed: $e');
+      _say('Install failed: $e');
     } finally {
       if (mounted) setState(() => _busy = false);
     }
@@ -444,11 +530,11 @@ class _SetupTabState extends State<_SetupTab> {
     setState(() => _busy = true);
     try {
       await api.tailscaleLogin(key);
-      widget.onNotice(key == null
+      _say(key == null
           ? 'Browser sign-in started — complete it in your browser, then come back.'
           : 'Login with auth key started.');
     } catch (e) {
-      widget.onNotice('Login failed: $e');
+      _say('Login failed: $e');
     } finally {
       if (mounted) setState(() => _busy = false);
     }
@@ -473,11 +559,16 @@ class _SetupTabState extends State<_SetupTab> {
         ),
         const Text(
           'First launch: if Tailscale is missing, this app downloads the '
-          'official installer and runs it — one Windows admin prompt will '
-          'appear. Then sign in once (browser, or an auth key from your '
-          'Tailscale admin console). After that the connection is headless.',
+          'official installer and runs it hidden — one Windows admin prompt '
+          'will appear; approve it. Then sign in once (browser, or an auth '
+          'key from your Tailscale admin console). After that the connection '
+          'is headless. The result of every step shows below the buttons.',
           style: TextStyle(color: Colors.grey),
         ),
+        if (_setupMessage != null) ...[
+          const SizedBox(height: 8),
+          Card(child: ListTile(title: Text(_setupMessage!))),
+        ],
         const SizedBox(height: 12),
         TextField(
           controller: _version,

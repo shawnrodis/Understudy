@@ -1,4 +1,13 @@
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 //! understudy-engine: the control service that runs on the owner's PC.
+//!
+//! NOTE on the attribute above: on Windows this binary is a GUI-subsystem
+//! program, so it NEVER creates a console window or a taskbar button of
+//! its own — the engine must be fully windowless (the Flutter app is its
+//! only visible presence, and single-instance there guarantees one
+//! taskbar icon total). Stdout prints below are therefore only visible
+//! on non-Windows dev runs; on Windows the pairing token lives in
+//! `auth.token` in the data dir, which the Flutter UI reads directly.
 //!
 //! It serves the control API (see `api.rs` and CONTROL_API.md) on the
 //! Tailscale interface only, and exits — closing all listeners — when it
@@ -11,10 +20,12 @@
 //! * `--bind` is restricted: only 127.0.0.1 or the machine's current
 //!   Tailscale IPv4 address is accepted. 0.0.0.0 and any other address are
 //!   refused, because this service must never listen on a public network.
-//! * On first run a bearer token is generated and stored in the data dir.
-//!   It is printed ONCE to stdout so the owner can copy it into the
-//!   controller that will operate this PC. It is never printed again and
-//!   must never be committed anywhere.
+//! * On first run a bearer token is generated and stored in the data dir
+//!   (`auth.token`). The Flutter UI reads that file to reveal the token
+//!   to the owner; the token is never printed again after first run and
+//!   must never be committed anywhere. `POST /auth/rotate` replaces it
+//!   (old token dies immediately); the UI re-reads the file after a
+//!   rotation.
 
 mod api;
 mod auth;

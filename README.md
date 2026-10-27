@@ -17,7 +17,8 @@ An understudy steps in and performs your role when you can't be there. That is w
 This tool grants **full user-level control** of the PC it runs on. That is the point — and it is why the guardrails are not optional:
 
 - **Tailscale-only listening.** The engine binds to the machine's Tailscale IPv4 address (or loopback when Tailscale is down). It never binds `0.0.0.0` and never listens on a public interface. A `--bind` override is accepted only for loopback or the machine's own Tailscale IP; anything else is refused.
-- **Key auth.** Every API endpoint requires `Authorization: Bearer <token>`. The token is generated on first run, stored only on the controlled PC (`%APPDATA%\Understudy\auth.token`), and printed once so the owner can pair a controller. There are no unauthenticated endpoints.
+- **Key auth.** Every API endpoint requires `Authorization: Bearer <token>`. The token is generated on first run, stored only on the controlled PC (`%APPDATA%\Understudy\auth.token`), and printed once so the owner can pair a controller. There are no unauthenticated endpoints. If a token ever leaks, the Status screen's **Rotate pairing token** button generates a fresh one and kills the old one immediately (`POST /auth/rotate`); the new token is re-read from `auth.token`, never returned over the API.
+- **Single instance.** The app enforces exactly one running copy: launching it again raises the existing window and exits — no duplicate windows, engines, or taskbar icons. The engine itself is fully windowless (no console window, no taskbar button of its own). If stale duplicate icons from an older version are still showing, quit each old copy once (tray → Quit); no new duplicates can appear after that.
 - **Full action log.** Every request — including rejected ones — is appended to a local JSON-lines log (`%APPDATA%\Understudy\actions.log`), viewable in the app. Tokens, auth keys, and file contents are never logged.
 - **Kill switch.** Closing the app (tray → Quit) stops the engine and closes all listeners immediately. `POST /shutdown` does the same from the API side. Ending the engine process ends everything regardless.
 - **Scoped file access.** File transfer is restricted to allowed roots (default: the user's profile directory). Paths escaping those roots are rejected.
@@ -25,8 +26,8 @@ This tool grants **full user-level control** of the PC it runs on. That is the p
 ## Setup
 
 1. Run the installer once (`Understudy_Setup_<version>.exe` from the GitHub release).
-2. On first launch, if Tailscale is missing, the app downloads the official Tailscale MSI and installs it — **one Windows admin (UAC) prompt will appear**. Then sign in once: either tap through the browser sign-in, or paste an auth key from your Tailscale admin console. After that the connection is headless.
-3. The engine prints its first-run pairing token once. Copy it into the controller that will operate this PC (for Muse, hand it over in chat once). The app's Status screen can reveal it again later.
+2. On first launch, if Tailscale is missing, the app downloads the official Tailscale MSI and installs it hidden — **one Windows admin (UAC) prompt will appear; approve it**. The install runs with no console window, and success is only reported after the install is verified (`tailscale.exe` present and answering); any failure — download, declined prompt, bad installer — is shown right on the Tailscale tab with its reason. Then sign in once: either tap through the browser sign-in, or paste an auth key from your Tailscale admin console. After that the connection is headless. (If automatic version detection ever fails, type a version number explicitly in the version field.)
+3. The engine stores its first-run pairing token in `%APPDATA%\Understudy\auth.token`. Copy it into the controller that will operate this PC (for Muse, hand it over in chat once). The app's Status screen can reveal it again later, and rotate it if it ever leaks.
 4. Operate the PC through the API: see [CONTROL_API.md](CONTROL_API.md) for the complete contract.
 
 **SmartScreen note:** the installer is unsigned, so Windows SmartScreen will prompt on first run. That is expected — the owner's other unsigned apps behave the same way, and he accepts that.
@@ -53,7 +54,7 @@ The Linux VM cannot build Flutter Windows targets, so Windows builds run in GitH
 - **CI** (`ci.yml`): engine unit tests on Linux, engine type-check for the Windows target, Flutter analyze.
 - **Release** (`release-windows.yml`): on a version tag (or manual dispatch), builds the Rust engine and the Flutter app on `windows-latest`, stages them, builds the NSIS installer, uploads it as a workflow artifact, and attaches it to the GitHub release.
 
-To cut a release: `git tag v0.1.0 && git push origin v0.1.0` — the workflow builds the installer and attaches it to the release.
+To cut a release: `git tag v0.1.1 && git push origin v0.1.1` — the workflow builds the installer and attaches it to the release.
 
 To build the engine locally (any platform with Rust):
 

@@ -112,6 +112,11 @@ class ApiClient {
   Future<Map<String, dynamic>> tailscaleLogin([String? authKey]) =>
       _post('/tailscale/login', {if (authKey != null) 'authkey': authKey});
 
+  /// Rotate the pairing token: the old token dies immediately. The new
+  /// token is NOT returned here; re-read it from auth.token afterwards.
+  Future<Map<String, dynamic>> rotateToken() =>
+      _post('/auth/rotate', {});
+
   /// The kill switch: stops the engine (all listeners close), after which
   /// this app exits too.
   Future<void> shutdown() async {
