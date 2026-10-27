@@ -5,6 +5,8 @@
 /// headlessly by the AI operator. This app exists to:
 ///   * launch and watch over the engine process,
 ///   * show connection status, monitors, and the connected indicator,
+///   * surface the pairing details (base URL, bearer token, workflow)
+///     that an AI controller needs to connect,
 ///   * show the action log,
 ///   * offer the kill switch (Quit stops the engine and closes everything),
 ///   * walk first-launch Tailscale setup (auto-install + one-time login).
@@ -17,6 +19,7 @@ import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:tray_manager/tray_manager.dart';
 import 'package:window_manager/window_manager.dart';
 
@@ -70,6 +73,79 @@ Future<void> _enforceSingleInstance() async {
     // If the guard port cannot be bound, run anyway rather than brick
     // the launch; the window still opens, just without the guard.
   }
+}
+
+/// Copy [text] to the clipboard and confirm it in a snackbar. Used by the
+/// pairing controls, which is the only place the token leaves the app —
+/// straight to the clipboard, never to the log or the network.
+Future<void> _copyToClipboard(
+    BuildContext context, String text, String message) async {
+  await Clipboard.setData(ClipboardData(text: text));
+  if (!context.mounted) return;
+  final messenger = ScaffoldMessenger.of(context);
+  messenger.hideCurrentSnackBar();
+  messenger.showSnackBar(SnackBar(
+    content: Text(message),
+    duration: const Duration(seconds: 4),
+  ));
+}
+
+/// Everything an AI controller needs to connect, as one paste-ready block:
+/// base URL, bearer token, the header it must send on every request, whether
+/// it can actually be reached, the session workflow, and where the complete
+/// endpoint contract lives. Written so it makes sense to a model that has
+/// never seen this repository.
+String _controllerBrief(ApiClient api) {
+  final token = api.info.token;
+  final reach = api.info.ip.startsWith('127.')
+      ? 'REACHABILITY: the engine is bound to loopback because Tailscale was '
+          'down when it started, so nothing outside this PC can reach it yet. '
+          'Finish Tailscale setup, then restart the engine (tray -> Quit, '
+          'relaunch) so it binds to the Tailscale address.'
+      : 'REACHABILITY: the engine listens on this PC\'s Tailscale IPv4 only, '
+          'never 0.0.0.0, so the controller must be on the same tailnet. If '
+          'a request cannot connect at all, check that first.';
+  return '''Understudy control API - connection details for an AI controller.
+
+Base URL: ${api.info.base}
+Header required on EVERY request: Authorization: Bearer $token
+Bearer token: $token
+
+$reach
+
+There are no unauthenticated endpoints. A 401 means the token was rotated or
+regenerated - pair again with the current token from Understudy's Status
+screen. 501 means the capability requires Windows and the host is not Windows.
+
+Session workflow:
+  1. GET /status
+  2. GET /monitors
+  3. GET /monitors/{id}/screenshot  (raw PNG bytes of exactly that monitor)
+  4. Read positions off that PNG in the monitor's logical (DIP) space,
+     measured from that monitor's own top-left corner.
+  5. Act with POST /input/move, /input/click or /input/scroll using that
+     monitor id and those coordinates. /input/type and /input/keys take no
+     position. Never mix coordinates from one monitor into another's actions.
+
+Endpoints:
+  GET  /status /monitors /monitors/{id}/screenshot /apps /files/download?path=
+       /log /tailscale/status
+  POST /input/move /input/click /input/scroll /input/type /input/keys
+       /apps/launch /apps/kill /files/upload /cmd /tailscale/install
+       /tailscale/login /auth/rotate /shutdown
+Success is {"ok":true,...}; failure is {"ok":false,"error":"..."} with HTTP
+400 (bad request), 401 (auth), 404, 500, or 501. Screenshots and file
+downloads return raw bytes instead of JSON on success.
+
+Operating notes: start every session with /status and /monitors; screenshot
+before acting and never click blind; prefer /cmd and /apps/* for deterministic
+work and reserve injected input for GUI-only steps; after a destructive action
+verify with a read before reporting success.
+
+The complete contract is CONTROL_API.md in the shawnrodis/Understudy
+repository - keep it with the controller. Keep this block private: anyone
+holding the token can operate this PC.
+''';
 }
 
 class UnderstudyApp extends StatelessWidget {
@@ -542,8 +618,9 @@ class _StatusTab extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final active = status?['session_active'] == true;
-    // Local copy so null checks promote (fields do not promote).
+    // Local copies so null checks promote (fields do not promote).
     final upd = update;
+    final apiClient = api;
     return ListView(
       padding: const EdgeInsets.all(16),
       children: [
@@ -724,11 +801,83 @@ class _StatusTab extends StatelessWidget {
         if (notice != null)
           Card(child: ListTile(title: Text(notice!))),
         const SizedBox(height: 8),
-        OutlinedButton.icon(
-          onPressed: onReveal,
-          icon: const Icon(Icons.key),
-          label: Text(tokenRevealed ? 'Hide pairing token' : 'Reveal pairing token'),
-        ),
+        // Pairing, shown as one block: the base URL used to live only in
+        // connection.json, so a controller had the token and no way to
+        // reach the engine. Base URL + token + workflow belong together.
+        if (apiClient != null) ...[
+          Card(
+            child: Padding(
+              padding: const EdgeInsets.all(16),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(children: [
+                    const Icon(Icons.smart_toy, size: 18),
+                    const SizedBox(width: 8),
+                    Text('Connect an AI controller',
+                        style: Theme.of(context).textTheme.titleMedium),
+                  ]),
+                  const SizedBox(height: 4),
+                  const Text(
+                    'An AI operating this PC needs three things: the base URL '
+                    'below, the bearer token, and CONTROL_API.md — the control '
+                    'API contract, in the Understudy repository.',
+                    style: TextStyle(color: Colors.grey),
+                  ),
+                  const SizedBox(height: 12),
+                  Row(children: [
+                    const Text('Base URL:  ',
+                        style: TextStyle(fontWeight: FontWeight.bold)),
+                    Expanded(child: SelectableText(apiClient.info.base)),
+                    IconButton(
+                      tooltip: 'Copy base URL',
+                      icon: const Icon(Icons.copy, size: 18),
+                      onPressed: () => _copyToClipboard(
+                          context, apiClient.info.base, 'Base URL copied.'),
+                    ),
+                  ]),
+                  const SizedBox(height: 4),
+                  Text(
+                    apiClient.info.ip.startsWith('127.')
+                        ? 'Bound to loopback — Tailscale was down when the '
+                            'engine started, so nothing outside this PC can '
+                            'reach it yet. Finish Tailscale setup, then '
+                            'restart the engine so it binds to the Tailscale '
+                            'address.'
+                        : "Listening on this PC's Tailscale address only "
+                            '(never 0.0.0.0) — the controller must be on the '
+                            'same tailnet.',
+                    style: const TextStyle(color: Colors.grey),
+                  ),
+                ],
+              ),
+            ),
+          ),
+          const SizedBox(height: 8),
+        ],
+        Row(children: [
+          Expanded(
+            child: OutlinedButton.icon(
+              onPressed: onReveal,
+              icon: const Icon(Icons.key),
+              label:
+                  Text(tokenRevealed ? 'Hide pairing token' : 'Reveal pairing token'),
+            ),
+          ),
+          if (apiClient != null) ...[
+            const SizedBox(width: 8),
+            OutlinedButton.icon(
+              onPressed: () => _copyToClipboard(
+                context,
+                apiClient.info.token,
+                'Bearer token copied — paste it only into a controller you '
+                    'trust.',
+              ),
+              icon: const Icon(Icons.copy),
+              label: const Text('Copy token'),
+            ),
+          ],
+        ]),
         if (tokenRevealed)
           FutureBuilder<EngineInfo?>(
             future: readEngineInfo(),
@@ -739,6 +888,29 @@ class _StatusTab extends StatelessWidget {
               );
             },
           ),
+        if (apiClient != null) ...[
+          const SizedBox(height: 8),
+          SizedBox(
+            width: double.infinity,
+            child: FilledButton.icon(
+              onPressed: () => _copyToClipboard(
+                context,
+                _controllerBrief(apiClient),
+                'Connection details copied: base URL, bearer token and '
+                    'workflow. Keep them private — anyone holding them can '
+                    'operate this PC.',
+              ),
+              icon: const Icon(Icons.content_paste),
+              label: const Text('Copy connection details for the AI'),
+            ),
+          ),
+          const Text(
+            'One paste gives the controller everything: base URL, bearer '
+            'token, the header to send, reachability, and the session '
+            'workflow. Copy it into the AI session that will operate this PC.',
+            style: TextStyle(color: Colors.grey),
+          ),
+        ],
         const SizedBox(height: 8),
         OutlinedButton.icon(
           onPressed: onRotate,
