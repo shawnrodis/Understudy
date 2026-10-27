@@ -1,4 +1,4 @@
-# Understudy Control API — contract (v0.1.3)
+# Understudy Control API — contract (v0.1.4)
 
 This document is the complete contract for operating an Understudy-controlled
 PC. It is written so that a future Muse session can operate the PC through
@@ -92,7 +92,7 @@ Response:
 ```json
 {
   "ok": true,
-  "version": "0.1.3",
+  "version": "0.1.4",
   "bind": "tailscale-or-loopback",
   "monitors": 2,
   "uptime_s": 3600,

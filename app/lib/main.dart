@@ -720,15 +720,18 @@ class _StatusTab extends StatelessWidget {
           // Local copies so null checks promote (fields do not).
           final tsLocal = ts;
           final port = enginePort;
+          final apiLocal = api;
           final ip = tsLocal?['ip'];
           final connected = tsLocal != null &&
               tsLocal['logged_in'] == true &&
               ip is String &&
               ip.isNotEmpty &&
-              port != null;
-          // The extra null checks promote the locals for use below
-          // (Dart does not promote through the `connected` boolean).
-          if (!connected || tsLocal == null || port == null) {
+              port != null &&
+              apiLocal != null;
+          // `connected` is a final local, so testing it promotes
+          // tsLocal, port and apiLocal below — extra null checks here are
+          // redundant (the analyzer reports them as always false).
+          if (!connected) {
             return const Card(
               child: ListTile(
                 leading: Icon(Icons.link_off),
@@ -738,7 +741,12 @@ class _StatusTab extends StatelessWidget {
               ),
             );
           }
-          final address = 'http://$ip:$port';
+          // The engine's own address wins: connection.json records what
+          // the listener is actually bound to, which is loopback when
+          // Tailscale connected after the engine started — quoting the
+          // Tailscale IP alone would advertise an address nothing
+          // answers on.
+          final address = apiLocal.info.base;
           final deviceName =
               tsLocal['device_name'] as String? ?? 'unknown';
           return Card(
@@ -801,9 +809,11 @@ class _StatusTab extends StatelessWidget {
         if (notice != null)
           Card(child: ListTile(title: Text(notice!))),
         const SizedBox(height: 8),
-        // Pairing, shown as one block: the base URL used to live only in
-        // connection.json, so a controller had the token and no way to
-        // reach the engine. Base URL + token + workflow belong together.
+        // Pairing: the token half of the handshake, next to the address
+        // card above. The address and the token are never rendered
+        // together in one copyable block on screen; they leave the app
+        // together only through the explicitly labelled copy button
+        // below, never by a stray selection.
         if (apiClient != null) ...[
           Card(
             child: Padding(
@@ -819,24 +829,13 @@ class _StatusTab extends StatelessWidget {
                   ]),
                   const SizedBox(height: 4),
                   const Text(
-                    'An AI operating this PC needs three things: the base URL '
-                    'below, the bearer token, and CONTROL_API.md — the control '
-                    'API contract, in the Understudy repository.',
+                    'An AI operating this PC needs three things: the address '
+                    'in the Controller connection card above, the bearer '
+                    'token, and CONTROL_API.md — the control API contract, '
+                    'in the Understudy repository.',
                     style: TextStyle(color: Colors.grey),
                   ),
-                  const SizedBox(height: 12),
-                  Row(children: [
-                    const Text('Base URL:  ',
-                        style: TextStyle(fontWeight: FontWeight.bold)),
-                    Expanded(child: SelectableText(apiClient.info.base)),
-                    IconButton(
-                      tooltip: 'Copy base URL',
-                      icon: const Icon(Icons.copy, size: 18),
-                      onPressed: () => _copyToClipboard(
-                          context, apiClient.info.base, 'Base URL copied.'),
-                    ),
-                  ]),
-                  const SizedBox(height: 4),
+                  const SizedBox(height: 8),
                   Text(
                     apiClient.info.ip.startsWith('127.')
                         ? 'Bound to loopback — Tailscale was down when the '
@@ -1042,10 +1041,13 @@ class _SetupTabState extends State<_SetupTab> {
               : ts['installed'] == true
                   ? 'Tailscale installed'
                   : 'Tailscale not installed'),
-          subtitle: Text(ts?['ip'] != null
-              ? 'Connected as ${ts!['ip']}'
-                  '${ts!['device_name'] != null ? ' · ${ts!['device_name']}' : ''}'
-              : 'Not connected yet'),
+          // Written as an explicit null test (not `ts?['ip'] != null`
+          // followed by `!`): the test promotes this local for the whole
+          // branch, so nothing downstream needs a redundant `!`.
+          subtitle: Text(ts == null || ts['ip'] == null
+              ? 'Not connected yet'
+              : 'Connected as ${ts['ip']}'
+                  '${ts['device_name'] != null ? ' · ${ts['device_name']}' : ''}'),
         ),
         if (widget.api == null) ...[
           Card(
