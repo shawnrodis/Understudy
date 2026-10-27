@@ -116,11 +116,45 @@ pub fn tailscale_ip(cli: &PathBuf) -> Option<String> {
 }
 
 /// One-line status for the setup screen: installed? logged in? IP?
+/// `device_name` is the machine's Tailscale device name (from
+/// `tailscale status --json`): it is what a controller needs alongside
+/// the IP to identify this PC. It is None when the name cannot be
+/// determined — callers must show "unknown", never a fabricated name.
 #[derive(Debug)]
 pub struct TsStatus {
     pub installed: bool,
     pub logged_in: bool,
     pub ip: Option<String>,
+    pub device_name: Option<String>,
+}
+
+/// Extract the device name from `tailscale status --json` output:
+/// prefer `Self.HostName`; fall back to the first label of
+/// `Self.DNSName` (e.g. "shawn-pc" from "shawn-pc.tailxxx.ts.net").
+/// Pure function, unit-tested. Returns None on any parse failure or
+/// when neither field is present — never a guessed name.
+pub fn extract_device_name(status_json: &str) -> Option<String> {
+    let v = crate::json::parse(status_json).ok()?;
+    let self_obj = v.get("Self")?;
+    if let Some(name) = self_obj.get("HostName").and_then(|h| h.as_str()) {
+        let name = name.trim();
+        if !name.is_empty() {
+            return Some(name.to_string());
+        }
+    }
+    if let Some(dns) = self_obj.get("DNSName").and_then(|d| d.as_str()) {
+        let first = dns.split('.').next().unwrap_or("").trim();
+        if !first.is_empty() {
+            return Some(first.to_string());
+        }
+    }
+    None
+}
+
+/// `tailscale status --json` device name, if determinable.
+pub fn device_name(cli: &PathBuf) -> Option<String> {
+    let out = run_cli(cli, &["status", "--json"]).ok()?;
+    extract_device_name(&out)
 }
 
 pub fn status() -> TsStatus {
@@ -129,13 +163,16 @@ pub fn status() -> TsStatus {
             installed: false,
             logged_in: false,
             ip: None,
+            device_name: None,
         },
         Some(cli) => {
             let ip = tailscale_ip(&cli);
+            let device_name = device_name(&cli);
             TsStatus {
                 installed: true,
                 logged_in: ip.is_some(),
                 ip,
+                device_name,
             }
         }
     }
@@ -388,6 +425,34 @@ mod tests {
         assert_eq!(
             parse_stable_version_from_listing(html).as_deref(),
             Some("1.104.2")
+        );
+    }
+
+    #[test]
+    fn device_name_prefers_hostname() {
+        let json = r#"{"Self": {"HostName": "Shawn-PC", "DNSName": "shawn-pc.tail1234.ts.net", "TailscaleIPs": ["100.64.0.5"]}}"#;
+        assert_eq!(
+            extract_device_name(json).as_deref(),
+            Some("Shawn-PC")
+        );
+    }
+
+    #[test]
+    fn device_name_falls_back_to_dns_label() {
+        let json = r#"{"Self": {"DNSName": "shawn-pc.tail1234.ts.net"}}"#;
+        assert_eq!(
+            extract_device_name(json).as_deref(),
+            Some("shawn-pc")
+        );
+    }
+
+    #[test]
+    fn device_name_returns_none_when_unknown() {
+        assert_eq!(extract_device_name("{}"), None);
+        assert_eq!(extract_device_name("not json at all"), None);
+        assert_eq!(
+            extract_device_name(r#"{"Self": {"HostName": ""}}"#),
+            None
         );
     }
 

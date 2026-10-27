@@ -68,7 +68,7 @@ The Linux VM cannot build Flutter Windows targets, so Windows builds run in GitH
 - **CI** (`ci.yml`): engine unit tests on Linux, engine type-check for the Windows target, Flutter analyze.
 - **Release** (`release-windows.yml`): on a version tag (or manual dispatch), builds the Rust engine and the Flutter app on `windows-latest`, stages them, builds the NSIS installer, uploads it as a workflow artifact, and attaches it to the GitHub release.
 
-To cut a release: `git tag v0.1.2 && git push origin v0.1.2` — the workflow builds the installer and attaches it to the release.
+To cut a release: `git tag v0.1.3 && git push origin v0.1.3` — the workflow builds the installer and attaches it to the release.
 
 To build the engine locally (any platform with Rust):
 

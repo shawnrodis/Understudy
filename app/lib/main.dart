@@ -456,6 +456,8 @@ class _HomeScreenState extends State<HomeScreen> with WindowListener {
                 _StatusTab(
                   status: _status,
                   monitors: _monitors,
+                  ts: _ts,
+                  enginePort: _api?.info.port,
                   api: _api,
                   tokenRevealed: _tokenRevealed,
                   onReveal: () =>
@@ -500,6 +502,8 @@ class _StatusTab extends StatelessWidget {
   const _StatusTab({
     required this.status,
     required this.monitors,
+    required this.ts,
+    required this.enginePort,
     required this.api,
     required this.tokenRevealed,
     required this.onReveal,
@@ -518,6 +522,8 @@ class _StatusTab extends StatelessWidget {
 
   final Map<String, dynamic>? status;
   final List<dynamic> monitors;
+  final Map<String, dynamic>? ts;
+  final int? enginePort;
   final ApiClient? api;
   final bool tokenRevealed;
   final VoidCallback onReveal;
@@ -624,6 +630,77 @@ class _StatusTab extends StatelessWidget {
             ),
           ),
         ),
+        const SizedBox(height: 8),
+        // Controller connection: the address a controller needs to
+        // reach this PC — Tailscale device name + IP + control port
+        // in one copyable line. This is deliberately separate from the
+        // pairing-token reveal below: the address and the token are
+        // never shown together in one copyable block, so they cannot
+        // be pasted out together by accident. When Tailscale is not
+        // connected, this says so plainly instead of showing a stale
+        // or empty address.
+        Builder(builder: (context) {
+          // Local copies so null checks promote (fields do not).
+          final tsLocal = ts;
+          final port = enginePort;
+          final ip = tsLocal?['ip'];
+          final connected = tsLocal != null &&
+              tsLocal['logged_in'] == true &&
+              ip is String &&
+              ip.isNotEmpty &&
+              port != null;
+          // The extra null checks promote the locals for use below
+          // (Dart does not promote through the `connected` boolean).
+          if (!connected || tsLocal == null || port == null) {
+            return const Card(
+              child: ListTile(
+                leading: Icon(Icons.link_off),
+                title: Text('Controller connection'),
+                subtitle: Text('Not connected to Tailscale — connect on '
+                    'the Tailscale tab'),
+              ),
+            );
+          }
+          final address = 'http://$ip:$port';
+          final deviceName =
+              tsLocal['device_name'] as String? ?? 'unknown';
+          return Card(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                ListTile(
+                  leading: const Icon(Icons.link, color: Colors.green),
+                  title: const Text('Controller connection'),
+                  subtitle: Text('Device $deviceName · Tailscale IP $ip · '
+                      'port $port'),
+                ),
+                Padding(
+                  padding:
+                      const EdgeInsets.fromLTRB(16, 0, 16, 8),
+                  child: Row(
+                    children: [
+                      Expanded(child: SelectableText(address)),
+                      IconButton(
+                        icon: const Icon(Icons.copy),
+                        tooltip: 'Copy controller address',
+                        onPressed: () {
+                          Clipboard.setData(
+                              ClipboardData(text: address));
+                          ScaffoldMessenger.of(context).showSnackBar(
+                            const SnackBar(
+                              content: Text(
+                                  'Controller address copied'),
+                            ),
+                          );
+                        },
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+          );
+        }),
         const SizedBox(height: 8),
         const Text('Monitors shared',
             style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
@@ -795,6 +872,7 @@ class _SetupTabState extends State<_SetupTab> {
                   : 'Tailscale not installed'),
           subtitle: Text(ts?['ip'] != null
               ? 'Connected as ${ts!['ip']}'
+                  '${ts!['device_name'] != null ? ' · ${ts!['device_name']}' : ''}'
               : 'Not connected yet'),
         ),
         if (widget.api == null) ...[

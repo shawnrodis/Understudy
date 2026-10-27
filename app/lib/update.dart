@@ -14,7 +14,7 @@ import 'dart:io';
 import 'api_client.dart';
 
 /// Bump this with every release (it must match the release tag).
-const kAppVersion = '0.1.2';
+const kAppVersion = '0.1.3';
 
 const _repo = 'shawnrodis/Understudy';
 

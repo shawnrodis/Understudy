@@ -61,7 +61,7 @@ jobs:
         shell: pwsh
         run: |
           $version = "${{ github.ref_name }}".TrimStart("v")
-          if ([string]::IsNullOrEmpty($version) -or $version -eq "workflow_dispatch") { $version = "0.1.2" }
+          if ([string]::IsNullOrEmpty($version) -or $version -eq "workflow_dispatch") { $version = "0.1.3" }
           # /NOCD is the fix for the previous failure: by default makensis
           # changes its working directory to the .nsi file's folder
           # (installer\), so the script's repo-root-relative

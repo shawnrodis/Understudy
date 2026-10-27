@@ -26,7 +26,7 @@ use crate::auth::{bearer_token, tokens_equal};
 use crate::json::{self, quote, Value};
 use crate::{capture, cmd, files, input, log, monitors, process, tailscale};
 
-pub const VERSION: &str = "0.1.2";
+pub const VERSION: &str = "0.1.3";
 
 /// Shared server state.
 pub struct State {
@@ -482,10 +482,13 @@ fn route(state: &Arc<State>, req: &Request) -> Response {
         ("GET", "/tailscale/status") => {
             let s = tailscale::status();
             ok_json(&format!(
-                "\"installed\":{},\"logged_in\":{},\"ip\":{}",
+                "\"installed\":{},\"logged_in\":{},\"ip\":{},\"device_name\":{}",
                 s.installed,
                 s.logged_in,
-                s.ip.map(|ip| quote(&ip)).unwrap_or("null".to_string())
+                s.ip.map(|ip| quote(&ip)).unwrap_or("null".to_string()),
+                s.device_name
+                    .map(|n| quote(&n))
+                    .unwrap_or("null".to_string())
             ))
         }
         ("POST", "/tailscale/install") => {

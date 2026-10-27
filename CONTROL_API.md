@@ -1,4 +1,4 @@
-# Understudy Control API — contract (v0.1.2)
+# Understudy Control API — contract (v0.1.3)
 
 This document is the complete contract for operating an Understudy-controlled
 PC. It is written so that a future Muse session can operate the PC through
@@ -92,7 +92,7 @@ Response:
 ```json
 {
   "ok": true,
-  "version": "0.1.2",
+  "version": "0.1.3",
   "bind": "tailscale-or-loopback",
   "monitors": 2,
   "uptime_s": 3600,
@@ -245,10 +245,30 @@ was supplied); tokens and file contents are never logged.
 ### GET /tailscale/status
 
 ```json
-{"ok": true, "installed": true, "logged_in": true, "ip": "100.64.0.5"}
+{"ok": true, "installed": true, "logged_in": true, "ip": "100.64.0.5", "device_name": "Shawn-PC"}
 ```
 
 `ip` is `null` when Tailscale is installed but not connected.
+`device_name` comes from `tailscale status --json` (`Self.HostName`,
+falling back to the first label of `Self.DNSName`); it is `null` when
+the name cannot be determined — never a fabricated name.
+
+### Controller address (what a controller connects to)
+
+A controller needs TWO things, and the token alone is neither of them:
+the PC's Tailscale address and a route to the tailnet (i.e. the
+controller's own machine must be joined to the same tailnet). The
+address is composed from this endpoint plus the engine's control port
+(from `connection.json`):
+
+```
+http://<tailscale-ip>:<control-port>
+```
+
+The Status tab in the app shows exactly this line (device name, IP,
+port) with a Copy button, and reads "Not connected to Tailscale" when
+there is no connection — it never shows a stale or loopback address
+as the controller address.
 
 ### POST /tailscale/install
 
