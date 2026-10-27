@@ -21,6 +21,7 @@ import 'package:tray_manager/tray_manager.dart';
 import 'package:window_manager/window_manager.dart';
 
 import 'api_client.dart';
+import 'update.dart';
 
 /// Loopback port the single-instance guard listens on. Unrelated to the
 /// engine's control port (18769): this one exists only so a second app
@@ -31,6 +32,8 @@ void main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await windowManager.ensureInitialized();
   await _enforceSingleInstance();
+  // X hides the window to the tray; it never quits. Quitting happens
+  // only via the tray menu's Quit entry or the in-app Quit button.
   await windowManager.setPreventClose(true);
   runApp(const UnderstudyApp());
 }
@@ -105,9 +108,19 @@ class _HomeScreenState extends State<HomeScreen> with WindowListener {
   List<dynamic> _monitors = [];
   List<dynamic> _log = [];
   Map<String, dynamic>? _ts;
-  String? _error;
   String? _notice;
   bool _engineStarting = false;
+  // Engine lifecycle: 'starting' while a spawn/probe is in flight,
+  // 'running' once a status probe has answered, 'failed' otherwise.
+  // Tabs are always reachable now; this state drives a card on the
+  // Status tab instead of replacing every tab with a dead screen.
+  String _engineState = 'starting';
+  String? _engineFailure;
+  DateTime? _lastSpawnAttempt;
+  bool _quitting = false;
+  UpdateInfo? _update;
+  bool _updateChecking = false;
+  String? _updateMessage;
   bool _tokenRevealed = false;
   Timer? _poller;
 
@@ -117,16 +130,24 @@ class _HomeScreenState extends State<HomeScreen> with WindowListener {
     windowManager.addListener(this);
     _initTray();
     _ensureEngine();
-    _poller = Timer.periodic(const Duration(seconds: 3), (_) => _refresh());
+    _autoUpdateCheck();
+    _poller = Timer.periodic(const Duration(seconds: 3), (_) => _tick());
   }
 
   Future<void> _initTray() async {
+    // The icon and the menu are set independently on purpose: if the
+    // icon fails, the menu — including Quit — must still exist. One
+    // try block around both is how the Quit entry goes missing.
     try {
       final exeDir = File(Platform.resolvedExecutable).parent;
       final ico = File('${exeDir.path}/icon.ico');
       if (await ico.exists()) {
         await trayManager.setIcon(ico.path);
       }
+    } catch (_) {
+      // Tray icon is a convenience; the app must work without it.
+    }
+    try {
       await trayManager.setContextMenu(
         Menu(items: [
           MenuItem(
@@ -140,7 +161,8 @@ class _HomeScreenState extends State<HomeScreen> with WindowListener {
         ]),
       );
     } catch (_) {
-      // Tray is a convenience; the app must work without it.
+      // Without a menu there is no tray Quit; the in-app Quit button
+      // on the Status tab remains the kill switch.
     }
   }
 
@@ -150,51 +172,184 @@ class _HomeScreenState extends State<HomeScreen> with WindowListener {
     await windowManager.hide();
   }
 
-  Future<void> _ensureEngine() async {
+  /// Make sure an engine is running and connected, spawning one from
+  /// this app's own install folder when needed. Safe to call repeatedly:
+  /// it probes for a live engine first and never spawns a second one
+  /// while one answers. [manual] bypasses the auto-respawn cooldown
+  /// (the "Start engine" button); automatic retries stay throttled so
+  /// an instantly-crashing engine cannot hot-loop spawns.
+  Future<void> _ensureEngine({bool manual = false}) async {
     if (_engineStarting) return;
+    if (!manual &&
+        _lastSpawnAttempt != null &&
+        DateTime.now().difference(_lastSpawnAttempt!) <
+            const Duration(seconds: 15)) {
+      return;
+    }
     _engineStarting = true;
+    _lastSpawnAttempt = DateTime.now();
+    if (mounted) {
+      setState(() {
+        _engineState = 'starting';
+        _engineFailure = null;
+      });
+    }
     try {
-      final info = await readEngineInfo();
-      if (info != null) {
-        _api = ApiClient(info);
-        await _refresh();
-        return;
-      }
-      final exeDir = File(Platform.resolvedExecutable).parent;
-      final engineExe = File('${exeDir.path}/understudy-engine.exe');
-      final dir = await dataDir();
-      if (await engineExe.exists()) {
-        _engine = await Process.start(
-          engineExe.path,
-          ['--data-dir', dir.path],
-          mode: ProcessStartMode.detached,
-        );
-        // Poll until the engine writes connection.json.
-        for (var i = 0; i < 20; i++) {
+      // 1. Is an engine already answering? (User-launched, or a previous
+      // spawn — see _probeLive for why a bare connection.json is not
+      // trusted on its own.)
+      if (await _probeLive()) return;
+      // 2. A connection.json exists but nothing answers yet: the engine
+      // may be mid-startup. Give it a few seconds before spawning.
+      if (await readEngineInfo() != null) {
+        for (var i = 0; i < 6; i++) {
           await Future<void>.delayed(const Duration(milliseconds: 500));
-          final found = await readEngineInfo();
-          if (found != null) {
-            _api = ApiClient(found);
-            break;
-          }
+          if (await _probeLive()) return;
         }
       }
-      await _refresh();
+      // 3. Spawn the engine from this app's own install folder. No setup
+      // prerequisite, no manual step.
+      final exeDir = File(Platform.resolvedExecutable).parent;
+      final engineExe = File('${exeDir.path}/understudy-engine.exe');
+      if (!await engineExe.exists()) {
+        throw Exception(
+            'Engine binary not found next to the app (${engineExe.path}). '
+            'Reinstall Understudy.');
+      }
+      final dir = await dataDir();
+      final proc = await Process.start(
+        engineExe.path,
+        ['--data-dir', dir.path],
+        mode: ProcessStartMode.detached,
+      );
+      _engine = proc;
+      // If the engine dies, say so instead of spinning forever. The
+      // _quitting flag keeps an intentional Quit from flagging a failure.
+      unawaited(proc.exitCode.then((code) {
+        if (_quitting || !mounted || _engine != proc) return;
+        setState(() {
+          _api = null;
+          _engineState = 'failed';
+          _engineFailure =
+              'Engine exited (code $code). Use Start engine to retry; '
+              'if it keeps exiting, another copy may be holding the '
+              'control port.';
+        });
+      }));
+      // 4. Wait for readiness, confirmed with a live probe — not merely
+      // the appearance of connection.json.
+      for (var i = 0; i < 30; i++) {
+        await Future<void>.delayed(const Duration(milliseconds: 500));
+        if (await _probeLive()) return;
+      }
+      if (mounted) {
+        setState(() {
+          _engineState = 'failed';
+          _engineFailure =
+              'Engine did not become ready within 15s. Use Start engine '
+              'to retry.';
+        });
+      }
     } catch (e) {
-      setState(() => _error = 'Engine start failed: $e');
+      if (mounted) {
+        setState(() {
+          _engineState = 'failed';
+          _engineFailure = 'Engine start failed: $e';
+        });
+      }
     } finally {
       _engineStarting = false;
+    }
+  }
+
+  /// True when connection.json exists AND the engine answers /status.
+  /// A bare connection.json proves nothing on its own: the file survives
+  /// uninstalls and dead engines (the data dir is intentionally kept),
+  /// so trusting it without a live probe is what wedged fresh installs
+  /// on a dead "Waiting for the engine…" screen forever.
+  Future<bool> _probeLive() async {
+    try {
+      final info = await readEngineInfo();
+      if (info == null) return false;
+      final api = ApiClient(info);
+      await api.status();
+      if (!mounted) return false;
+      _api = api;
+      setState(() {
+        _engineState = 'running';
+        _engineFailure = null;
+      });
+      await _refresh();
+      return _api != null;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// Periodic maintenance: refresh when connected, otherwise make sure
+  /// an engine is coming up (throttled automatic respawn).
+  Future<void> _tick() async {
+    if (_api != null) {
+      await _refresh();
+    } else if (_engineState != 'starting') {
+      await _ensureEngine();
+    }
+  }
+
+  /// Automatic launch check: silent unless a newer release exists.
+  /// Independent of the engine — it talks to GitHub directly.
+  Future<void> _autoUpdateCheck() async {
+    final info = await checkForUpdate();
+    if (!mounted) return;
+    if (info != null && info.available) {
+      setState(() => _update = info);
+    }
+  }
+
+  Future<void> _manualUpdateCheck() async {
+    setState(() {
+      _updateChecking = true;
+      _updateMessage = null;
+    });
+    final info = await checkForUpdate(manual: true);
+    if (!mounted) return;
+    setState(() {
+      _updateChecking = false;
+      if (info == null) {
+        _updateMessage = 'Update check failed.';
+      } else if (info.error != null) {
+        _updateMessage = 'Update check failed: ${info.error}';
+      } else if (info.available) {
+        _update = info;
+        _updateMessage = null;
+      } else {
+        _updateMessage = 'You are up to date (v$kAppVersion).';
+      }
+    });
+  }
+
+  Future<void> _downloadAndInstall() async {
+    final info = _update;
+    if (info == null || info.downloadUrl.isEmpty) return;
+    setState(() => _updateMessage = 'Downloading update…');
+    try {
+      final path = await downloadInstaller(info.downloadUrl, info.version);
+      await launchInstallerAfterQuit(path, pid);
+      // The installer launches once this process exits; quitting now
+      // is what lets it replace the running files.
+      await _quit();
+    } catch (e) {
+      if (mounted) {
+        setState(() => _updateMessage = 'Download failed: $e');
+      }
     }
   }
 
   Future<void> _refresh() async {
     final api = _api;
     if (api == null) {
-      final info = await readEngineInfo();
-      if (info != null) {
-        _api = ApiClient(info);
-        return _refresh();
-      }
+      // The manual refresh button doubles as a recovery button.
+      await _ensureEngine();
       return;
     }
     try {
@@ -208,10 +363,29 @@ class _HomeScreenState extends State<HomeScreen> with WindowListener {
         _monitors = (mons['monitors'] as List<dynamic>?) ?? [];
         _log = (logRes['entries'] as List<dynamic>?) ?? [];
         _ts = ts;
-        _error = null;
+        _engineState = 'running';
+        _engineFailure = null;
+      });
+    } on SocketException {
+      // Connection refused: the engine is gone (or never started). Do
+      // NOT surface the raw exception: Dart reports the client's own
+      // ephemeral local port in SocketException.port, not the engine's
+      // port — that is what made a dead engine look like a port
+      // mismatch. Drop the dead client so the watchdog respawns
+      // instead of hammering the same dead endpoint forever.
+      if (!mounted) return;
+      setState(() {
+        _api = null;
+        _engineState = 'failed';
+        _engineFailure =
+            'Engine unreachable at ${api.info.base} — the engine is not '
+            'running. It will be restarted automatically, or use Start '
+            'engine.';
       });
     } catch (e) {
-      if (mounted) setState(() => _error = 'Engine unreachable: $e');
+      if (mounted) {
+        setState(() => _engineFailure = 'Engine request failed: $e');
+      }
     }
   }
 
@@ -233,6 +407,7 @@ class _HomeScreenState extends State<HomeScreen> with WindowListener {
   }
 
   Future<void> _quit() async {
+    _quitting = true;
     try {
       await _api?.shutdown();
     } catch (_) {}
@@ -272,9 +447,10 @@ class _HomeScreenState extends State<HomeScreen> with WindowListener {
           ),
         ],
       ),
-      body: _error != null && _status == null
-          ? _SetupNeeded(error: _error!)
-          : IndexedStack(
+      // Tabs are always reachable: engine trouble is a card on the
+      // Status tab (and a note on the Tailscale tab), never a screen
+      // that replaces every tab.
+      body: IndexedStack(
               index: _tab,
               children: [
                 _StatusTab(
@@ -287,12 +463,21 @@ class _HomeScreenState extends State<HomeScreen> with WindowListener {
                   onRotate: _rotateToken,
                   onQuit: _quit,
                   notice: _notice,
+                  engineState: _engineState,
+                  engineFailure: _engineFailure,
+                  onStartEngine: () => _ensureEngine(manual: true),
+                  update: _update,
+                  updateChecking: _updateChecking,
+                  updateMessage: _updateMessage,
+                  onCheckUpdate: _manualUpdateCheck,
+                  onDownloadInstall: _downloadAndInstall,
                 ),
                 _LogTab(entries: _log),
                 _SetupTab(
                   ts: _ts,
                   api: _api,
                   onNotice: (s) => setState(() => _notice = s),
+                  onStartEngine: () => _ensureEngine(manual: true),
                 ),
               ],
             ),
@@ -311,39 +496,6 @@ class _HomeScreenState extends State<HomeScreen> with WindowListener {
   }
 }
 
-class _SetupNeeded extends StatelessWidget {
-  const _SetupNeeded({required this.error});
-  final String error;
-
-  @override
-  Widget build(BuildContext context) {
-    return Center(
-      child: Padding(
-        padding: const EdgeInsets.all(24),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            const Icon(Icons.hourglass_top, size: 48),
-            const SizedBox(height: 16),
-            const Text(
-              'Waiting for the engine…',
-              style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
-            ),
-            const SizedBox(height: 8),
-            Text(error, textAlign: TextAlign.center),
-            const SizedBox(height: 8),
-            const Text(
-              'If the engine is not installed next to this app, run '
-              'understudy-engine.exe once from the install folder.',
-              textAlign: TextAlign.center,
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-}
-
 class _StatusTab extends StatelessWidget {
   const _StatusTab({
     required this.status,
@@ -354,6 +506,14 @@ class _StatusTab extends StatelessWidget {
     required this.onRotate,
     required this.onQuit,
     required this.notice,
+    required this.engineState,
+    required this.engineFailure,
+    required this.onStartEngine,
+    required this.update,
+    required this.updateChecking,
+    required this.updateMessage,
+    required this.onCheckUpdate,
+    required this.onDownloadInstall,
   });
 
   final Map<String, dynamic>? status;
@@ -364,13 +524,89 @@ class _StatusTab extends StatelessWidget {
   final VoidCallback onRotate;
   final VoidCallback onQuit;
   final String? notice;
+  final String engineState;
+  final String? engineFailure;
+  final VoidCallback onStartEngine;
+  final UpdateInfo? update;
+  final bool updateChecking;
+  final String? updateMessage;
+  final VoidCallback onCheckUpdate;
+  final VoidCallback onDownloadInstall;
 
   @override
   Widget build(BuildContext context) {
     final active = status?['session_active'] == true;
+    // Local copy so null checks promote (fields do not promote).
+    final upd = update;
     return ListView(
       padding: const EdgeInsets.all(16),
       children: [
+        if (engineState != 'running') ...[
+          Card(
+            child: ListTile(
+              leading: engineState == 'starting'
+                  ? const SizedBox(
+                      width: 18,
+                      height: 18,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    )
+                  : const Icon(Icons.error, color: Colors.red, size: 18),
+              title: Text(engineState == 'starting'
+                  ? 'Starting engine…'
+                  : 'Engine not running'),
+              subtitle:
+                  engineFailure == null ? null : Text(engineFailure!),
+              trailing: engineState == 'starting'
+                  ? null
+                  : TextButton(
+                      onPressed: onStartEngine,
+                      child: const Text('Start engine'),
+                    ),
+            ),
+          ),
+          const SizedBox(height: 8),
+        ],
+        Card(
+          child: ListTile(
+            leading: const Icon(Icons.system_update),
+            title: Text(upd != null
+                ? 'Update available: v${upd.version}'
+                : updateChecking
+                    ? 'Checking for updates…'
+                    : 'Updates'),
+            subtitle: updateMessage == null
+                ? const Text(
+                    'Understudy checks for updates at most once a day.')
+                : Text(updateMessage!),
+          ),
+        ),
+        if (upd != null) ...[
+          const SizedBox(height: 8),
+          ConstrainedBox(
+            constraints: const BoxConstraints(maxHeight: 200),
+            child: SingleChildScrollView(
+              child: SelectableText(
+                  upd.notes.isEmpty ? 'No release notes.' : upd.notes),
+            ),
+          ),
+          const SizedBox(height: 8),
+        ],
+        Row(children: [
+          OutlinedButton.icon(
+            onPressed: updateChecking ? null : onCheckUpdate,
+            icon: const Icon(Icons.refresh),
+            label: const Text('Check for updates'),
+          ),
+          if (upd != null) ...[
+            const SizedBox(width: 8),
+            FilledButton.icon(
+              onPressed: onDownloadInstall,
+              icon: const Icon(Icons.download),
+              label: const Text('Download & install'),
+            ),
+          ],
+        ]),
+        const SizedBox(height: 8),
         Card(
           child: ListTile(
             leading: Icon(
@@ -482,10 +718,14 @@ class _LogTab extends StatelessWidget {
 
 class _SetupTab extends StatefulWidget {
   const _SetupTab(
-      {required this.ts, required this.api, required this.onNotice});
+      {required this.ts,
+      required this.api,
+      required this.onNotice,
+      required this.onStartEngine});
   final Map<String, dynamic>? ts;
   final ApiClient? api;
   final ValueChanged<String> onNotice;
+  final VoidCallback onStartEngine;
 
   @override
   State<_SetupTab> createState() => _SetupTabState();
@@ -557,6 +797,23 @@ class _SetupTabState extends State<_SetupTab> {
               ? 'Connected as ${ts!['ip']}'
               : 'Not connected yet'),
         ),
+        if (widget.api == null) ...[
+          Card(
+            child: ListTile(
+              leading: const Icon(Icons.info),
+              title: const Text('Engine not running yet'),
+              subtitle: const Text(
+                  'Tailscale setup runs through the engine. Start the '
+                  'engine first — it launches from this app automatically, '
+                  'no manual step needed.'),
+              trailing: TextButton(
+                onPressed: widget.onStartEngine,
+                child: const Text('Start engine'),
+              ),
+            ),
+          ),
+          const SizedBox(height: 8),
+        ],
         const Text(
           'First launch: if Tailscale is missing, this app downloads the '
           'official installer and runs it hidden — one Windows admin prompt '

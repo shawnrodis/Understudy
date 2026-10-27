@@ -1,4 +1,4 @@
-# Understudy Control API — contract (v0.1.1)
+# Understudy Control API — contract (v0.1.2)
 
 This document is the complete contract for operating an Understudy-controlled
 PC. It is written so that a future Muse session can operate the PC through
@@ -9,6 +9,23 @@ engine; it is never required to perform any action below.
 Base URL: `http://<tailscale-ip>:18769` (port overridable with the engine's
 `--port` flag). When Tailscale is down, the engine listens on `127.0.0.1`
 instead; it never listens on `0.0.0.0` or a public interface.
+
+## Ports
+
+- Control API: port **18769** by default (overridable with the engine's
+  `--port` flag). The engine writes the port it actually bound into
+  `connection.json`, and the Flutter app reads that file — the two sides
+  cannot disagree. The Flutter app also starts the engine itself on
+  launch (from its own install folder) and restarts it if it dies; you
+  never need to run the engine by hand.
+- The Flutter app's single-instance guard is a separate loopback-only
+  port, **18771**, used only so a second app launch can find the first.
+  It is not the control API.
+- If you ever see a SocketException naming a random high port (e.g.
+  "port = 61105") while the engine is down: that number is the *client's*
+  own ephemeral local port, which Dart reports in SocketException — it
+  is not the engine's port. The engine's port is always 18769 unless
+  `--port` says otherwise.
 
 ## Authentication
 
@@ -75,7 +92,7 @@ Response:
 ```json
 {
   "ok": true,
-  "version": "0.1.0",
+  "version": "0.1.2",
   "bind": "tailscale-or-loopback",
   "monitors": 2,
   "uptime_s": 3600,

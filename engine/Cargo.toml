@@ -1,6 +1,6 @@
 [package]
 name = "understudy-engine"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 description = "Understudy control engine: Tailscale-only HTTP control API for operating your own Windows PC (screen capture, input injection, apps, files, commands)."
 license = "GPL-3.0-only"

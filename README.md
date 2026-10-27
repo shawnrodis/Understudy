@@ -32,6 +32,20 @@ This tool grants **full user-level control** of the PC it runs on. That is the p
 
 **SmartScreen note:** the installer is unsigned, so Windows SmartScreen will prompt on first run. That is expected — the owner's other unsigned apps behave the same way, and he accepts that.
 
+## Updates
+
+The tray app checks the `shawnrodis/Understudy` GitHub Releases API on
+launch, at most once per 24h (throttled by a stamp file in the data
+dir), silently: no update and check failures show nothing. The Status
+tab also has **Check for updates** for a manual check, which always
+reports its result. When a newer release exists, the Status tab shows
+its version and release notes with a **Download & install** button.
+Nothing is ever installed silently: tapping it downloads the new
+installer, then quits this app (engine included) and launches the
+installer elevated — one UAC prompt, expected — so it can replace the
+running files. If the UAC prompt is declined, just relaunch the app and
+try again.
+
 ## Architecture
 
 ```
@@ -54,7 +68,7 @@ The Linux VM cannot build Flutter Windows targets, so Windows builds run in GitH
 - **CI** (`ci.yml`): engine unit tests on Linux, engine type-check for the Windows target, Flutter analyze.
 - **Release** (`release-windows.yml`): on a version tag (or manual dispatch), builds the Rust engine and the Flutter app on `windows-latest`, stages them, builds the NSIS installer, uploads it as a workflow artifact, and attaches it to the GitHub release.
 
-To cut a release: `git tag v0.1.1 && git push origin v0.1.1` — the workflow builds the installer and attaches it to the release.
+To cut a release: `git tag v0.1.2 && git push origin v0.1.2` — the workflow builds the installer and attaches it to the release.
 
 To build the engine locally (any platform with Rust):
 

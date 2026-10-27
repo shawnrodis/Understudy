@@ -82,6 +82,39 @@ fn default_file_roots() -> Vec<PathBuf> {
     }
 }
 
+/// Serialize connection.json. The port written here is ALWAYS the port
+/// the listener actually bound (default 18769, or the --port value) —
+/// never an ephemeral port. (A past field report showed "port = 61105"
+/// in a UI error; that number was the Dart client's own ephemeral local
+/// port, which Dart reports in SocketException, not this engine's port.)
+fn connection_json(
+    bind_ip: &str,
+    port: u16,
+    version: &str,
+    tailscale_installed: bool,
+    tailscale_ip: Option<&str>,
+) -> String {
+    format!(
+        "{{\"ip\":{},\"port\":{},\"version\":{},\"tailscale_installed\":{},\"tailscale_ip\":{}}}",
+        crate::json::quote(bind_ip),
+        port,
+        crate::json::quote(version),
+        tailscale_installed,
+        tailscale_ip
+            .map(|ip| crate::json::quote(ip))
+            .unwrap_or_else(|| "null".to_string()),
+    )
+}
+
+/// Write a file atomically: temp file in the same directory + rename,
+/// so a concurrent reader never sees a half-written file.
+fn write_atomic(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, contents)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
 fn print_usage() {
     eprintln!("understudy-engine [--port PORT] [--data-dir DIR] [--bind IP]");
     eprintln!("  --port      control API port (default {})", DEFAULT_PORT);
@@ -187,18 +220,27 @@ fn main() {
     };
 
     // Connection info for the local Flutter UI to discover this engine.
-    let conn = format!(
-        "{{\"ip\":{},\"port\":{},\"version\":{},\"tailscale_installed\":{},\"tailscale_ip\":{}}}",
-        crate::json::quote(&bind_ip),
+    // Written atomically: the UI polls this file while the engine
+    // starts, and a half-written file would read as "no engine" and
+    // could trigger a second spawn.
+    let conn = connection_json(
+        &bind_ip,
         port,
-        crate::json::quote(api::VERSION),
+        api::VERSION,
         ts.installed,
-        ts.ip
-            .clone()
-            .map(|ip| crate::json::quote(&ip))
-            .unwrap_or_else(|| "null".to_string()),
+        ts.ip.as_deref(),
     );
-    let _ = std::fs::write(data_dir.join("connection.json"), conn);
+    let conn_path = data_dir.join("connection.json");
+    if let Err(e) = write_atomic(&conn_path, &conn) {
+        // Best effort: a stale connection.json is worse than a
+        // directly-written one, but never fail startup over it.
+        eprintln!(
+            "cannot write {}: {}; falling back to direct write",
+            conn_path.display(),
+            e
+        );
+        let _ = std::fs::write(&conn_path, conn);
+    }
 
     let mons = monitors::enumerate();
     println!(
@@ -227,4 +269,45 @@ fn main() {
     }
     log::append(&data_dir, "engine_stopped", true, "shutdown requested");
     println!("Understudy engine stopped.");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn connection_json_preserves_the_bound_port() {
+        let s = connection_json("127.0.0.1", 18769, "0.1.2", false, None);
+        assert!(s.contains("\"port\":18769"), "got: {s}");
+        assert!(s.contains("\"ip\":\"127.0.0.1\""), "got: {s}");
+        assert!(s.contains("\"tailscale_ip\":null"), "got: {s}");
+    }
+
+    #[test]
+    fn connection_json_custom_port_and_tailscale_ip() {
+        let s =
+            connection_json("100.64.0.1", 19999, "0.1.2", true, Some("100.64.0.1"));
+        assert!(s.contains("\"port\":19999"), "got: {s}");
+        assert!(s.contains("\"tailscale_ip\":\"100.64.0.1\""), "got: {s}");
+        assert!(s.contains("\"tailscale_installed\":true"), "got: {s}");
+    }
+
+    #[test]
+    fn write_atomic_round_trip() {
+        let dir = std::env::temp_dir().join("understudy-write-atomic-test");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("connection.json");
+        write_atomic(&path, "{\"port\":18769}").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "{\"port\":18769}"
+        );
+        // Overwriting an existing file works too (rename replaces it).
+        write_atomic(&path, "{\"port\":19999}").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "{\"port\":19999}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
