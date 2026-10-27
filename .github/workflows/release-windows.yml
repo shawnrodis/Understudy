@@ -3,6 +3,12 @@ name: Build Windows installer
 on:
   push:
     tags: ["v*"]
+    # TEMPORARY (added for v0.1.4, remove afterwards): also cut a release
+    # from a branch whose name is the release tag, so a release can be
+    # published when tag pushes are not available from the machine cutting
+    # it. The attach step below names the tag explicitly, so the tag is
+    # created at this commit either way.
+    branches: ["v*"]
   workflow_dispatch:
 
 permissions:
@@ -77,8 +83,11 @@ jobs:
           path: Understudy_Setup_*.exe
 
       - name: Attach installer to the release
-        if: startsWith(github.ref, 'refs/tags/')
+        if: startsWith(github.ref, 'refs/tags/') || startsWith(github.ref, 'refs/heads/v')
         uses: softprops/action-gh-release@v2
         with:
+          # ref_name is the tag for a tag push and the branch name for the
+          # branch trigger above — both are "v<version>".
+          tag_name: ${{ github.ref_name }}
           files: Understudy_Setup_*.exe
           generate_release_notes: true
