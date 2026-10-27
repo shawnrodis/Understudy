@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  engine:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - name: Engine unit tests (Linux)
+        run: cargo test --manifest-path engine/Cargo.toml
+      - name: Engine type-check for Windows
+        run: cargo check --manifest-path engine/Cargo.toml --target x86_64-pc-windows-msvc
+
+  flutter-analyze:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+      - name: Analyze
+        working-directory: app
+        run: |
+          flutter pub get
+          flutter analyze

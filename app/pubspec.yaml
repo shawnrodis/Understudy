@@ -1,0 +1,19 @@
+name: understudy
+description: Understudy — monitor and control the Understudy engine on your own PC. The engine's control API is the primary interface; this app shows status, the action log, and the kill switch, and walks Tailscale setup.
+version: 0.1.0+1
+publish_to: none
+
+environment:
+  sdk: ">=3.3.0 <4.0.0"
+  flutter: ">=3.22.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  tray_manager: ^0.2.0
+  window_manager: ^0.4.0
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/icon.png

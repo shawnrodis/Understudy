@@ -1,0 +1,30 @@
+# Rust
+engine/target/
+Cargo.lock
+# (Cargo.lock is intentionally ignored for this binary crate's library-style
+# layout; CI resolves fresh. Keep it if a reproducible lockfile is wanted.)
+
+# Flutter
+app/.dart_tool/
+app/build/
+app/windows/
+app/.flutter-plugins
+app/.flutter-plugins-dependencies
+app/pubspec.lock
+
+# Installer staging + outputs
+build/
+*.exe
+!installer/*.nsi
+
+# Engine runtime data (token, action log, connection info) — never committed.
+*.token
+actions.log
+connection.json
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
