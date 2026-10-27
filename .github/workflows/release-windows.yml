@@ -33,6 +33,7 @@ jobs:
       - name: Build the Flutter app
         working-directory: app
         run: |
+          flutter config --enable-windows-desktop
           flutter pub get
           flutter build windows --release
 
@@ -40,9 +41,18 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force build\staging | Out-Null
+          # Fail loudly on a missing/empty source instead of staging nothing:
+          # a previous run staged an empty dir and NSIS failed downstream.
+          if (-not (Test-Path app\build\windows\x64\runner\Release\understudy.exe)) { throw "Flutter build output missing: app\build\windows\x64\runner\Release\understudy.exe" }
+          if (-not (Test-Path engine\target\release\understudy-engine.exe)) { throw "Engine binary missing: engine\target\release\understudy-engine.exe" }
           Copy-Item -Recurse app\build\windows\x64\runner\Release\* build\staging\
           Copy-Item engine\target\release\understudy-engine.exe build\staging\
           Copy-Item assets\icon.ico build\staging\
+          $staged = Get-ChildItem -Recurse build\staging
+          if ($staged.Count -eq 0) { throw "Staging is empty after copy" }
+          if (-not (Test-Path build\staging\understudy.exe)) { throw "Staged understudy.exe missing" }
+          if (-not (Test-Path build\staging\understudy-engine.exe)) { throw "Staged understudy-engine.exe missing" }
+          Write-Host "Staged contents:"; $staged | ForEach-Object { Write-Host "  $($_.FullName)" }
 
       - name: Install NSIS
         run: choco install nsis -y
@@ -52,7 +62,12 @@ jobs:
         run: |
           $version = "${{ github.ref_name }}".TrimStart("v")
           if ([string]::IsNullOrEmpty($version) -or $version -eq "workflow_dispatch") { $version = "0.1.0" }
-          & "C:\Program Files (x86)\NSIS\makensis.exe" /DVERSION=$version installer\understudy.nsi
+          # /NOCD is the fix for the previous failure: by default makensis
+          # changes its working directory to the .nsi file's folder
+          # (installer\), so the script's repo-root-relative
+          # build\staging path resolved to installer\build\staging and
+          # NSIS reported "no files found". /NOCD keeps the workspace root.
+          & "C:\Program Files (x86)\NSIS\makensis.exe" /NOCD /DVERSION=$version installer\understudy.nsi
           Get-ChildItem *.exe
 
       - name: Upload installer artifact

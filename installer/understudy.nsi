@@ -1,6 +1,9 @@
 ; Understudy Windows installer (NSIS).
 ; Built by CI: flutter build windows --release output + the Rust engine
 ; binary + icon are staged into build\staging before makensis runs.
+; NOTE: makensis changes its working directory to this script's folder by
+; default, so CI must pass /NOCD for build\staging (repo-root relative)
+; to resolve. Do not run this script bare from another directory.
 ; Unsigned installer: Windows SmartScreen will prompt on first run.
 ; That is expected (same as the owner's other unsigned apps).
 

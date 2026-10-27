@@ -42,7 +42,8 @@ class UnderstudyApp extends StatelessWidget {
           seedColor: const Color(0xFF1E1B4B),
           brightness: Brightness.dark,
         ).copyWith(secondary: const Color(0xFFF59E0B)),
-        useMaterial3: true,
+        // Material 3 is the default in current Flutter; the old
+        // useMaterial3 flag is deprecated and intentionally omitted.
       ),
       home: const HomeScreen(),
     );
