@@ -99,6 +99,11 @@ CONTROL_API.md          the complete control API contract
 SECURITY.md             security notes and token-handling rules
 ```
 
+## Field tests
+
+Real operator runs, with timings and an honest verdict, live in
+[FIELD_TESTS.md](FIELD_TESTS.md).
+
 ## License
 
 GPL-3.0. See [LICENSE](LICENSE).
