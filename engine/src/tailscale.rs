@@ -237,7 +237,7 @@ pub fn resolve_stable_version() -> Option<String> {
                 "-NonInteractive",
                 "-Command",
                 &format!(
-                    "(Invoke-WebRequest -Uri {} -UseBasicParsing).Content",
+                    "(Invoke-WebRequest -Uri {} -UseBasicParsing -TimeoutSec 60).Content",
                     ps_quote(LISTING_URL)
                 ),
             ])
@@ -276,7 +276,7 @@ pub fn install_windows(version: &str) -> Result<String, String> {
                 "-NonInteractive",
                 "-Command",
                 &format!(
-                    "Invoke-WebRequest -Uri {} -OutFile {} -UseBasicParsing",
+                    "Invoke-WebRequest -Uri {} -OutFile {} -UseBasicParsing -TimeoutSec 300",
                     ps_quote(&url),
                     ps_quote(&msi_arg)
                 ),
@@ -316,7 +316,7 @@ pub fn install_windows(version: &str) -> Result<String, String> {
                 || err.contains("1223")
             {
                 return Err(
-                    "Tailscale install cancelled — the admin prompt was declined"
+                    "Tailscale install cancelled — the admin prompt was declined; press Install again and approve the prompt"
                         .to_string(),
                 );
             }

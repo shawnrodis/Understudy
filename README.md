@@ -40,7 +40,10 @@ loopback. Tap **Install Ollama**, then **Pull model**
 immediately. Every action goes through the engine, so it lands in the
 action log like any controller's. The loop, CLI flags, and action JSON
 contract are documented in [CONTROL_API.md](CONTROL_API.md) ("Local
-operator").
+operator"). Install and pull buttons never silently do nothing: while
+one runs, its message card shows a live spinner, and every outcome —
+installed, already installed, installer window opened, or the failure
+reason — is reported on the tab.
 
 **SmartScreen note:** the installer is unsigned, so Windows SmartScreen will prompt on first run. That is expected — the owner's other unsigned apps behave the same way, and he accepts that.
 

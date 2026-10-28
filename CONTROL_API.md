@@ -339,7 +339,8 @@ Outcomes:
 - Installed now → `{"ok":true,"installed_version":"..."}`.
 - Silent install unverified → `{"ok":true,"launched_gui":true}`: the
   installer GUI opened for a one-click install; call this endpoint
-  again afterwards to verify.
+  again afterwards to verify. If the GUI itself fails to launch, that
+  is a 500 instead — a failed launch is never reported as opened.
 - Failure → 500 with the reason.
 On non-Windows hosts this endpoint returns an error — install Ollama
 with the host's package manager instead.

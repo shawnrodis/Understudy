@@ -1325,7 +1325,21 @@ class _SetupTabState extends State<_SetupTab> {
         ),
         if (_setupMessage != null) ...[
           const SizedBox(height: 8),
-          Card(child: ListTile(title: Text(_setupMessage!))),
+          // A live spinner while busy: the install runs minutes inside
+          // one engine call, and static text + a disabled button looked
+          // frozen. The spinner is the proof something is still running.
+          Card(
+            child: ListTile(
+              leading: _busy
+                  ? const SizedBox(
+                      width: 18,
+                      height: 18,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    )
+                  : null,
+              title: Text(_setupMessage!),
+            ),
+          ),
         ],
         const SizedBox(height: 12),
         TextField(
@@ -1529,7 +1543,14 @@ class _LocalTabState extends State<_LocalTab> {
       await api.ollamaPull(modelText);
       _say('Model $modelText pulled and verified.');
     } catch (e) {
-      _say('Model pull failed: $e');
+      // A bare "not installed" reason leaves the owner guessing; the
+      // next step is the Install button right above this message.
+      if ('$e'.contains('not installed')) {
+        _say('Model pull failed: Ollama is not installed — install '
+            'Ollama first, then pull.');
+      } else {
+        _say('Model pull failed: $e');
+      }
     } finally {
       if (mounted) setState(() => _ollamaBusy = false);
     }
@@ -1632,7 +1653,23 @@ class _LocalTabState extends State<_LocalTab> {
               ]),
               if (_message != null) ...[
                 const SizedBox(height: 8),
-                Card(child: ListTile(title: Text(_message!))),
+                // A live spinner while busy: a multi-GB pull runs
+                // minutes inside one engine call, and static text +
+                // disabled buttons looked dead. The spinner is the
+                // proof the pull is still running.
+                Card(
+                  child: ListTile(
+                    leading: _ollamaBusy
+                        ? const SizedBox(
+                            width: 18,
+                            height: 18,
+                            child:
+                                CircularProgressIndicator(strokeWidth: 2),
+                          )
+                        : null,
+                    title: Text(_message!),
+                  ),
+                ),
               ],
               const SizedBox(height: 16),
               const Text('Operator log',

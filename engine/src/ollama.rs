@@ -161,7 +161,7 @@ pub fn install_windows() -> Result<InstallOutcome, String> {
                 "-NonInteractive",
                 "-Command",
                 &format!(
-                    "Invoke-WebRequest -Uri {} -OutFile {} -UseBasicParsing",
+                    "Invoke-WebRequest -Uri {} -OutFile {} -UseBasicParsing -TimeoutSec 300",
                     ps_quote(DOWNLOAD_URL),
                     ps_quote(&setup_arg)
                 ),
@@ -194,15 +194,24 @@ pub fn install_windows() -> Result<InstallOutcome, String> {
         }
         // Silent install did not verify: fall back to the visible
         // one-click installer instead of claiming anything. The owner
-        // completes it, then taps Install again to verify.
-        let _ = hidden_command("powershell")
+        // completes it, then taps Install again to verify. The launch
+        // itself is checked now: previously its result was discarded,
+        // so a failed launch still reported "installer opened".
+        let gui = hidden_command("powershell")
             .args([
                 "-NoProfile",
                 "-NonInteractive",
                 "-Command",
                 &format!("Start-Process {}", ps_quote(&setup_arg)),
             ])
-            .output();
+            .output()
+            .map_err(|e| format!("could not launch the installer window: {}", e))?;
+        if !gui.status.success() {
+            return Err(format!(
+                "could not launch the installer window: {}",
+                String::from_utf8_lossy(&gui.stderr).trim()
+            ));
+        }
         Ok(InstallOutcome::GuiLaunched)
     }
 }
