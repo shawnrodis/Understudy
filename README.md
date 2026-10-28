@@ -30,6 +30,16 @@ This tool grants **full user-level control** of the PC it runs on. That is the p
 3. The engine stores its first-run pairing token in `%APPDATA%\Understudy\auth.token`. Copy it into the controller that will operate this PC (for Muse, hand it over in chat once). The app's Status screen shows the base URL too, and **Copy connection details for the AI** puts one paste-ready block on the clipboard — base URL, bearer token, the header to send, reachability, and the session workflow — so a controller never has to go hunting in `connection.json`. The Status screen can reveal the token again later, and rotate it if it ever leaks.
 4. Operate the PC through the API: see [CONTROL_API.md](CONTROL_API.md) for the complete contract.
 
+**Local mode (no Tailscale needed):** the app's **Local AI** tab runs a
+vision model ON this PC (Ollama) that operates the engine over
+loopback. Tap **Install Ollama**, then **Pull model**
+(`qwen3-vl:8b` by default — fits a 12 GB card), type a task, and press
+**Start**; the log shows every step live, and **Stop** kills the loop
+immediately. Every action goes through the engine, so it lands in the
+action log like any controller's. The loop, CLI flags, and action JSON
+contract are documented in [CONTROL_API.md](CONTROL_API.md) ("Local
+operator").
+
 **SmartScreen note:** the installer is unsigned, so Windows SmartScreen will prompt on first run. That is expected — the owner's other unsigned apps behave the same way, and he accepts that.
 
 ## Updates
@@ -68,7 +78,7 @@ The Linux VM cannot build Flutter Windows targets, so Windows builds run in GitH
 - **CI** (`ci.yml`): engine unit tests on Linux, engine type-check for the Windows target, Flutter analyze.
 - **Release** (`release-windows.yml`): on a version tag (or manual dispatch), builds the Rust engine and the Flutter app on `windows-latest`, stages them, builds the NSIS installer, uploads it as a workflow artifact, and attaches it to the GitHub release.
 
-To cut a release: `git tag v0.1.4 && git push origin v0.1.4` — the workflow builds the installer and attaches it to the release.
+To cut a release: `git tag v0.1.5 && git push origin v0.1.5` — the workflow builds the installer and attaches it to the release.
 
 To build the engine locally (any platform with Rust):
 

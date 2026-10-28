@@ -45,13 +45,16 @@ jobs:
           # a previous run staged an empty dir and NSIS failed downstream.
           if (-not (Test-Path app\build\windows\x64\runner\Release\understudy.exe)) { throw "Flutter build output missing: app\build\windows\x64\runner\Release\understudy.exe" }
           if (-not (Test-Path engine\target\release\understudy-engine.exe)) { throw "Engine binary missing: engine\target\release\understudy-engine.exe" }
+          if (-not (Test-Path engine\target\release\local-operator.exe)) { throw "Local-operator binary missing: engine\target\release\local-operator.exe" }
           Copy-Item -Recurse app\build\windows\x64\runner\Release\* build\staging\
           Copy-Item engine\target\release\understudy-engine.exe build\staging\
+          Copy-Item engine\target\release\local-operator.exe build\staging\
           Copy-Item assets\icon.ico build\staging\
           $staged = Get-ChildItem -Recurse build\staging
           if ($staged.Count -eq 0) { throw "Staging is empty after copy" }
           if (-not (Test-Path build\staging\understudy.exe)) { throw "Staged understudy.exe missing" }
           if (-not (Test-Path build\staging\understudy-engine.exe)) { throw "Staged understudy-engine.exe missing" }
+          if (-not (Test-Path build\staging\local-operator.exe)) { throw "Staged local-operator.exe missing" }
           Write-Host "Staged contents:"; $staged | ForEach-Object { Write-Host "  $($_.FullName)" }
 
       - name: Install NSIS
@@ -61,7 +64,7 @@ jobs:
         shell: pwsh
         run: |
           $version = "${{ github.ref_name }}".TrimStart("v")
-          if ([string]::IsNullOrEmpty($version) -or $version -eq "workflow_dispatch") { $version = "0.1.4" }
+          if ([string]::IsNullOrEmpty($version) -or $version -eq "workflow_dispatch") { $version = "0.1.5" }
           # /NOCD is the fix for the previous failure: by default makensis
           # changes its working directory to the .nsi file's folder
           # (installer\), so the script's repo-root-relative

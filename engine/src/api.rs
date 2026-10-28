@@ -24,9 +24,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::auth::{bearer_token, tokens_equal};
 use crate::json::{self, quote, Value};
-use crate::{capture, cmd, files, input, log, monitors, process, tailscale};
+use crate::{capture, cmd, files, input, jpeg, log, monitors, ollama, process, tailscale};
 
-pub const VERSION: &str = "0.1.4";
+pub const VERSION: &str = "0.1.5";
 
 /// Shared server state.
 pub struct State {
@@ -87,6 +87,15 @@ fn png_resp(bytes: Vec<u8>) -> Response {
         status: 200,
         reason: "OK",
         content_type: "image/png",
+        body: bytes,
+    }
+}
+
+fn jpeg_resp(bytes: Vec<u8>) -> Response {
+    Response {
+        status: 200,
+        reason: "OK",
+        content_type: "image/jpeg",
         body: bytes,
     }
 }
@@ -224,14 +233,65 @@ fn route(state: &Arc<State>, req: &Request) -> Response {
                 Ok(v) => v,
                 Err(_) => return err(400, "bad monitor id"),
             };
-            match capture::capture_monitor_png(&mons, id) {
-                Ok((w, h, png_bytes)) => {
-                    // Width/height ride along in a trailing JSON comment? No:
-                    // they are derivable from the PNG itself. Keep it pure.
-                    let _ = (w, h);
-                    png_resp(png_bytes)
+            // Optional query params (default behavior unchanged):
+            //   format=png|jpeg  (default png — the historical response)
+            //   width=<n>        downscale to n wide, aspect kept; values
+            //                    >= the native width mean "no downscale",
+            //                    never an upscale. The local-operator loop
+            //                    uses format=jpeg&width=1280 for small
+            //                    frames; remote controllers keep asking
+            //                    for plain PNG and notice nothing.
+            let format = query_param(&req.query, "format").unwrap_or_default();
+            if !format.is_empty() && format != "png" && format != "jpeg" {
+                return err(400, "format must be png or jpeg");
+            }
+            let width: Option<u32> = match query_param(&req.query, "width") {
+                None => None,
+                Some(v) => match v.parse::<u32>() {
+                    Ok(0) => return err(400, "width must be positive"),
+                    Ok(n) => Some(n),
+                    Err(_) => return err(400, "bad width"),
+                },
+            };
+            if format == "jpeg" {
+                match capture::capture_monitor_rgba(&mons, id) {
+                    Ok((w, h, rgba)) => {
+                        let (w2, h2, rgb) = match width {
+                            Some(tw) => {
+                                let (dw, dh, d) =
+                                    jpeg::downscale_rgb(&rgba, w, h, tw);
+                                (dw, dh, d)
+                            }
+                            None => {
+                                let mut rgb =
+                                    Vec::with_capacity((w * h * 3) as usize);
+                                for px in rgba.chunks_exact(4) {
+                                    rgb.extend_from_slice(&px[0..3]);
+                                }
+                                (w, h, rgb)
+                            }
+                        };
+                        match jpeg::encode_jpeg_rgb(w2, h2, &rgb, 80) {
+                            Ok(bytes) => jpeg_resp(bytes),
+                            Err(e) => err(500, &e),
+                        }
+                    }
+                    Err(e) => err(501, &e),
                 }
-                Err(e) => err(501, &e),
+            } else {
+                match capture::capture_monitor_rgba(&mons, id) {
+                    Ok((w, h, rgba)) => {
+                        let (w2, h2, rgba2) = match width {
+                            Some(tw) => jpeg::downscale_rgba(&rgba, w, h, tw),
+                            None => (w, h, rgba),
+                        };
+                        match crate::png::encode_rgba(w2, h2, &rgba2) {
+                            Ok(bytes) => png_resp(bytes),
+                            Err(e) => err(500, &e),
+                        }
+                    }
+                    Err(e) => err(501, &e),
+                }
             }
         }
         ("POST", "/input/move") => {
@@ -492,6 +552,15 @@ fn route(state: &Arc<State>, req: &Request) -> Response {
             ))
         }
         ("POST", "/tailscale/install") => {
+            // Reinstalls must not silently re-download: Tailscale itself
+            // survives an app uninstall, so an already-installed system
+            // reports that (with the version) instead of reinstalling.
+            if let Some(v) = tailscale::installed_version() {
+                return ok_json(&format!(
+                    "\"already_installed\":true,\"installed_version\":{}",
+                    quote(&v)
+                ));
+            }
             let body = match req.json_body() {
                 Ok(b) => b,
                 Err(e) => return err(400, &e),
@@ -549,6 +618,57 @@ fn route(state: &Arc<State>, req: &Request) -> Response {
         ("POST", "/shutdown") => {
             state.shutdown.store(true, Ordering::Relaxed);
             ok_json("\"shutting_down\":true")
+        }
+        ("GET", "/ollama/status") => {
+            let s = ollama::status();
+            let models = s
+                .models
+                .iter()
+                .map(|m| quote(m))
+                .collect::<Vec<_>>()
+                .join(",");
+            ok_json(&format!(
+                "\"installed\":{},\"version\":{},\"models\":[{}]",
+                s.installed,
+                s.version.map(|v| quote(&v)).unwrap_or("null".to_string()),
+                models
+            ))
+        }
+        ("POST", "/ollama/install") => match ollama::install_windows() {
+            Ok(ollama::InstallOutcome::AlreadyInstalled(v)) => ok_json(&format!(
+                "\"already_installed\":true,\"installed_version\":{}",
+                quote(&v)
+            )),
+            Ok(ollama::InstallOutcome::Installed(v)) => {
+                ok_json(&format!("\"installed_version\":{}", quote(&v)))
+            }
+            Ok(ollama::InstallOutcome::GuiLaunched) => {
+                ok_json("\"launched_gui\":true")
+            }
+            Err(e) => err(500, &e),
+        },
+        ("POST", "/ollama/pull") => {
+            let body = match req.json_body() {
+                Ok(b) => b,
+                Err(e) => return err(400, &e),
+            };
+            let model = body
+                .get("model")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let model = if model.trim().is_empty() {
+                ollama::DEFAULT_MODEL.to_string()
+            } else {
+                model
+            };
+            match ollama::pull(&model) {
+                Ok(()) => ok_json(&format!(
+                    "\"pulled\":true,\"model\":{}",
+                    quote(&model)
+                )),
+                Err(e) => err(500, &e),
+            }
         }
         _ => err(404, "unknown endpoint"),
     }

@@ -8,10 +8,12 @@
 /// the Authorization header to the engine itself.
 ///
 /// Only the monitoring/setup endpoints are used here: status, monitors,
-/// log, Tailscale setup, and shutdown (the kill switch). The full control
-/// endpoints (input, apps, files, cmd, screenshots) belong to the API's
-/// primary consumer — the AI operator — and are documented in
-/// CONTROL_API.md, not driven from this UI.
+/// log, Tailscale setup, Ollama setup, and shutdown (the kill switch).
+/// The full control endpoints (input, apps, files, cmd, screenshots)
+/// belong to the API's primary consumer — the AI operator — and are
+/// documented in CONTROL_API.md, not driven from this UI. (The Local AI
+/// tab spawns the separate local-operator binary; it does not drive
+/// control endpoints from Dart.)
 library;
 
 import 'dart:convert';
@@ -111,6 +113,11 @@ class ApiClient {
       _post('/tailscale/install', {'version': version});
   Future<Map<String, dynamic>> tailscaleLogin([String? authKey]) =>
       _post('/tailscale/login', {if (authKey != null) 'authkey': authKey});
+  Future<Map<String, dynamic>> ollamaStatus() => _get('/ollama/status');
+  Future<Map<String, dynamic>> ollamaInstall() =>
+      _post('/ollama/install', {});
+  Future<Map<String, dynamic>> ollamaPull(String model) =>
+      _post('/ollama/pull', {'model': model});
 
   /// Rotate the pairing token: the old token dies immediately. The new
   /// token is NOT returned here; re-read it from auth.token afterwards.

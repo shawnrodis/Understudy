@@ -1,6 +1,6 @@
 [package]
 name = "understudy-engine"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2021"
 description = "Understudy control engine: Tailscale-only HTTP control API for operating your own Windows PC (screen capture, input injection, apps, files, commands)."
 license = "GPL-3.0-only"
@@ -8,6 +8,10 @@ license = "GPL-3.0-only"
 [[bin]]
 name = "understudy-engine"
 path = "src/main.rs"
+
+[[bin]]
+name = "local-operator"
+path = "src/bin/local_operator.rs"
 
 [profile.release]
 opt-level = 2

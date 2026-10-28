@@ -29,31 +29,11 @@
 //! `tailscale` binary only and are never logged.
 
 use std::path::PathBuf;
-use std::process::Command;
+
+use crate::hidden::{hidden_command, ps_quote};
 
 /// Stable package listing page (used for latest-version resolution).
 pub const LISTING_URL: &str = "https://pkgs.tailscale.com/stable/";
-
-/// Spawn a helper process with no visible console window on Windows.
-/// Without CREATE_NO_WINDOW, a console helper spawned from a windowless
-/// parent gets a brand-new console window flashed on screen.
-#[cfg(windows)]
-fn hidden_command(program: &str) -> Command {
-    use std::os::windows::process::CommandExt;
-    let mut c = Command::new(program);
-    c.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
-    c
-}
-
-#[cfg(not(windows))]
-fn hidden_command(program: &str) -> Command {
-    Command::new(program)
-}
-
-/// Single-quote a string for PowerShell, doubling embedded quotes.
-fn ps_quote(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "''"))
-}
 
 /// MSI URL for a resolved stable version.
 pub fn msi_url(version: &str) -> String {
@@ -155,6 +135,21 @@ pub fn extract_device_name(status_json: &str) -> Option<String> {
 pub fn device_name(cli: &PathBuf) -> Option<String> {
     let out = run_cli(cli, &["status", "--json"]).ok()?;
     extract_device_name(&out)
+}
+
+/// Installed Tailscale version, if the CLI answers. The first line of
+/// `tailscale version` is the version number (a leading "tailscale
+/// version" prefix, if present, is stripped).
+pub fn installed_version() -> Option<String> {
+    let cli = find_cli()?;
+    let out = run_cli(&cli, &["version"]).ok()?;
+    let first = out.lines().next()?.trim();
+    let v = first.strip_prefix("tailscale version").unwrap_or(first).trim();
+    if v.is_empty() {
+        None
+    } else {
+        Some(v.to_string())
+    }
 }
 
 pub fn status() -> TsStatus {

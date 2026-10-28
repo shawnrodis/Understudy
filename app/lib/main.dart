@@ -9,13 +9,18 @@
 ///     that an AI controller needs to connect,
 ///   * show the action log,
 ///   * offer the kill switch (Quit stops the engine and closes everything),
-///   * walk first-launch Tailscale setup (auto-install + one-time login).
+///   * walk first-launch Tailscale setup (auto-install + one-time login),
+///   * drive local mode: a task prompt + Start/Stop + live log for the
+///     on-PC Ollama operator loop, and Ollama setup (install + model
+///     pull). The tab shows task input and log text ONLY — it is not a
+///     desktop view and offers no manual control surface.
 ///
 /// Closing the window tucks the app to the tray; Quit (tray menu or the
 /// Status screen's button) stops the engine and exits for real.
 library;
 
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
@@ -129,10 +134,13 @@ Session workflow:
 
 Endpoints:
   GET  /status /monitors /monitors/{id}/screenshot /apps /files/download?path=
-       /log /tailscale/status
+       /log /tailscale/status /ollama/status
   POST /input/move /input/click /input/scroll /input/type /input/keys
        /apps/launch /apps/kill /files/upload /cmd /tailscale/install
-       /tailscale/login /auth/rotate /shutdown
+       /tailscale/login /ollama/install /ollama/pull /auth/rotate /shutdown
+Screenshot query params (optional; defaults keep the historical PNG):
+  format=png|jpeg, width=<n> downscales to n wide, aspect kept, never
+  an upscale. The on-PC local operator uses format=jpeg&width=1280.
 Success is {"ok":true,...}; failure is {"ok":false,"error":"..."} with HTTP
 400 (bad request), 401 (auth), 404, 500, or 501. Screenshots and file
 downloads return raw bytes instead of JSON on success.
@@ -156,11 +164,34 @@ class UnderstudyApp extends StatelessWidget {
     return MaterialApp(
       title: 'Understudy',
       debugShowCheckedModeBanner: false,
+      // OLED black: every surface is true black, not dark gray. The
+      // amber accent and default dark-theme text stay readable on it.
+      // Theme-level only — no layout, copy, or widget changes.
       theme: ThemeData.dark().copyWith(
         colorScheme: ColorScheme.fromSeed(
           seedColor: const Color(0xFF1E1B4B),
           brightness: Brightness.dark,
-        ).copyWith(secondary: const Color(0xFFF59E0B)),
+        ).copyWith(
+          secondary: const Color(0xFFF59E0B),
+          surface: Colors.black,
+          surfaceContainerLowest: Colors.black,
+          surfaceContainerLow: Colors.black,
+          surfaceContainer: Colors.black,
+          surfaceContainerHigh: Colors.black,
+          surfaceContainerHighest: Colors.black,
+        ),
+        scaffoldBackgroundColor: Colors.black,
+        cardTheme: const CardThemeData(color: Colors.black),
+        dialogTheme: const DialogThemeData(backgroundColor: Colors.black),
+        appBarTheme: const AppBarTheme(backgroundColor: Colors.black),
+        bottomNavigationBarTheme: const BottomNavigationBarThemeData(
+          backgroundColor: Colors.black,
+        ),
+        snackBarTheme: const SnackBarThemeData(backgroundColor: Colors.black),
+        inputDecorationTheme: const InputDecorationTheme(
+          filled: true,
+          fillColor: Colors.black,
+        ),
         // Material 3 is the default in current Flutter; the old
         // useMaterial3 flag is deprecated and intentionally omitted.
       ),
@@ -184,6 +215,7 @@ class _HomeScreenState extends State<HomeScreen> with WindowListener {
   List<dynamic> _monitors = [];
   List<dynamic> _log = [];
   Map<String, dynamic>? _ts;
+  Map<String, dynamic>? _ollama;
   String? _notice;
   bool _engineStarting = false;
   // Engine lifecycle: 'starting' while a spawn/probe is in flight,
@@ -216,29 +248,47 @@ class _HomeScreenState extends State<HomeScreen> with WindowListener {
     // try block around both is how the Quit entry goes missing.
     try {
       final exeDir = File(Platform.resolvedExecutable).parent;
-      final ico = File('${exeDir.path}/icon.ico');
-      if (await ico.exists()) {
-        await trayManager.setIcon(ico.path);
+      // Installed layout first (icon.ico sits next to the exe), then
+      // the working directory as a fallback; absent is fine, skipped
+      // silently.
+      for (final dir in [exeDir, Directory.current]) {
+        final ico = File('${dir.path}/icon.ico');
+        if (await ico.exists()) {
+          await trayManager.setIcon(ico.path);
+          break;
+        }
       }
     } catch (_) {
       // Tray icon is a convenience; the app must work without it.
     }
-    try {
-      await trayManager.setContextMenu(
-        Menu(items: [
-          MenuItem(
-            label: 'Show Understudy',
-            onClick: (_) => windowManager.show(),
-          ),
-          MenuItem(
-            label: 'Quit (kill switch — stops the engine)',
-            onClick: (_) => _quit(),
-          ),
-        ]),
-      );
-    } catch (_) {
-      // Without a menu there is no tray Quit; the in-app Quit button
-      // on the Status tab remains the kill switch.
+    // The menu MUST offer Open and Quit. A first-attempt failure (the
+    // tray host not ready yet on a fresh launch) is retried once after
+    // a short delay instead of silently leaving the icon menu-less.
+    for (var attempt = 0; attempt < 2; attempt++) {
+      try {
+        await trayManager.setContextMenu(
+          Menu(items: [
+            MenuItem(
+              label: 'Open',
+              onClick: (_) async {
+                await windowManager.show();
+                await windowManager.focus();
+              },
+            ),
+            MenuItem(
+              label: 'Quit (kill switch — stops the engine)',
+              onClick: (_) => _quit(),
+            ),
+          ]),
+        );
+        break;
+      } catch (_) {
+        if (attempt == 0) {
+          await Future.delayed(const Duration(milliseconds: 500));
+        }
+        // Without a menu there is no tray Quit; the in-app Quit button
+        // on the Status tab remains the kill switch.
+      }
     }
   }
 
@@ -433,12 +483,21 @@ class _HomeScreenState extends State<HomeScreen> with WindowListener {
       final mons = await api.monitors();
       final logRes = await api.log(limit: 200);
       final ts = await api.tailscaleStatus();
+      // Ollama status is best-effort: it must never break the main
+      // refresh (an older engine has no /ollama/status endpoint).
+      Map<String, dynamic>? ollama;
+      try {
+        ollama = await api.ollamaStatus();
+      } catch (_) {
+        ollama = null;
+      }
       if (!mounted) return;
       setState(() {
         _status = status;
         _monitors = (mons['monitors'] as List<dynamic>?) ?? [];
         _log = (logRes['entries'] as List<dynamic>?) ?? [];
         _ts = ts;
+        _ollama = ollama;
         _engineState = 'running';
         _engineFailure = null;
       });
@@ -484,8 +543,13 @@ class _HomeScreenState extends State<HomeScreen> with WindowListener {
 
   Future<void> _quit() async {
     _quitting = true;
+    // Quit must never hang on a wedged engine: the shutdown call races
+    // a 2-second timeout, and the process kill + exit happen regardless.
     try {
-      await _api?.shutdown();
+      final shutdown = _api?.shutdown();
+      if (shutdown != null) {
+        await shutdown.timeout(const Duration(seconds: 2));
+      }
     } catch (_) {}
     try {
       _engine?.kill();
@@ -557,6 +621,10 @@ class _HomeScreenState extends State<HomeScreen> with WindowListener {
                   onNotice: (s) => setState(() => _notice = s),
                   onStartEngine: () => _ensureEngine(manual: true),
                 ),
+                _LocalTab(
+                  api: _api,
+                  ollama: _ollama,
+                ),
               ],
             ),
       bottomNavigationBar: BottomNavigationBar(
@@ -568,6 +636,8 @@ class _HomeScreenState extends State<HomeScreen> with WindowListener {
               icon: Icon(Icons.receipt_long), label: 'Action log'),
           BottomNavigationBarItem(
               icon: Icon(Icons.vpn_key), label: 'Tailscale'),
+          BottomNavigationBarItem(
+              icon: Icon(Icons.smart_toy), label: 'Local AI'),
         ],
       ),
     );
@@ -995,7 +1065,13 @@ class _SetupTabState extends State<_SetupTab> {
 
   Future<void> _install() async {
     final api = widget.api;
-    if (api == null) return;
+    // A dead Install button was the v0.1.4 field report: this used to
+    // return silently while the button stayed enabled. Now the button
+    // is disabled without an engine AND this path says so out loud.
+    if (api == null) {
+      _say('Engine not running yet — start the engine first.');
+      return;
+    }
     setState(() {
       _busy = true;
       _setupMessage =
@@ -1004,7 +1080,13 @@ class _SetupTabState extends State<_SetupTab> {
     });
     try {
       final res = await api.tailscaleInstall(_version.text.trim());
-      _say('Tailscale installed and verified: ${res['installed_version']}');
+      if (res['already_installed'] == true) {
+        _say('Tailscale is already installed '
+            '(${res['installed_version'] ?? 'unknown version'}) — '
+            'nothing to install.');
+      } else {
+        _say('Tailscale installed and verified: ${res['installed_version']}');
+      }
     } catch (e) {
       _say('Install failed: $e');
     } finally {
@@ -1014,7 +1096,10 @@ class _SetupTabState extends State<_SetupTab> {
 
   Future<void> _login([String? key]) async {
     final api = widget.api;
-    if (api == null) return;
+    if (api == null) {
+      _say('Engine not running yet — start the engine first.');
+      return;
+    }
     setState(() => _busy = true);
     try {
       await api.tailscaleLogin(key);
@@ -1088,7 +1173,7 @@ class _SetupTabState extends State<_SetupTab> {
         ),
         const SizedBox(height: 8),
         FilledButton(
-          onPressed: _busy ? null : _install,
+          onPressed: (_busy || widget.api == null) ? null : _install,
           child: const Text('Install Tailscale'),
         ),
         const SizedBox(height: 16),
@@ -1104,14 +1189,14 @@ class _SetupTabState extends State<_SetupTab> {
         Row(children: [
           Expanded(
             child: FilledButton(
-              onPressed: _busy ? null : () => _login(),
+              onPressed: (_busy || widget.api == null) ? null : () => _login(),
               child: const Text('Sign in via browser'),
             ),
           ),
           const SizedBox(width: 8),
           Expanded(
             child: OutlinedButton(
-              onPressed: _busy
+              onPressed: (_busy || widget.api == null)
                   ? null
                   : () => _login(
                       _authKey.text.trim().isEmpty ? null : _authKey.text.trim()),
@@ -1119,6 +1204,297 @@ class _SetupTabState extends State<_SetupTab> {
             ),
           ),
         ]),
+      ],
+    );
+  }
+}
+
+/// Local AI tab: task input + Start/Stop + live log for the on-PC
+/// Ollama operator loop, plus Ollama install / model pull. Text only:
+/// no desktop view, no manual control surface. The operator process is
+/// spawned from this app's install folder; Stop kills it immediately.
+class _LocalTab extends StatefulWidget {
+  const _LocalTab({required this.api, required this.ollama});
+  final ApiClient? api;
+  final Map<String, dynamic>? ollama;
+
+  @override
+  State<_LocalTab> createState() => _LocalTabState();
+}
+
+class _LocalTabState extends State<_LocalTab> {
+  final _task = TextEditingController();
+  final _model = TextEditingController(text: 'qwen3-vl:8b');
+  Process? _proc;
+  bool _running = false;
+  bool _ollamaBusy = false;
+  String? _message;
+  final List<String> _log = [];
+
+  @override
+  void dispose() {
+    _proc?.kill();
+    _task.dispose();
+    _model.dispose();
+    super.dispose();
+  }
+
+  void _say(String message) {
+    if (mounted) setState(() => _message = message);
+  }
+
+  String get _modelText {
+    final t = _model.text.trim();
+    return t.isEmpty ? 'qwen3-vl:8b' : t;
+  }
+
+  Future<void> _start() async {
+    final api = widget.api;
+    if (api == null) {
+      _say('Engine not running yet — start the engine first.');
+      return;
+    }
+    final taskText = _task.text.trim();
+    if (taskText.isEmpty) {
+      _say('Type a task first (for example: "open the Start menu").');
+      return;
+    }
+    try {
+      final exeDir = File(Platform.resolvedExecutable).parent;
+      final dir = await dataDir();
+      final proc = await Process.start(
+        '${exeDir.path}/local-operator.exe',
+        [
+          '--data-dir',
+          dir.path,
+          '--task',
+          taskText,
+          '--model',
+          _modelText,
+        ],
+      );
+      _proc = proc;
+      if (mounted) {
+        setState(() {
+          _running = true;
+          _log.add('Local operator started.');
+        });
+      }
+      proc.stdout
+          .transform(utf8.decoder)
+          .transform(const LineSplitter())
+          .listen((line) {
+        if (mounted) setState(() => _log.add(line));
+      });
+      proc.stderr
+          .transform(utf8.decoder)
+          .transform(const LineSplitter())
+          .listen((line) {
+        if (mounted) setState(() => _log.add('ERR $line'));
+      });
+      unawaited(proc.exitCode.then((code) {
+        if (mounted && _proc == proc) {
+          setState(() {
+            _running = false;
+            _proc = null;
+            _log.add('Local operator exited (code $code).');
+          });
+        }
+      }));
+    } catch (e) {
+      _say('Could not start the local operator: $e');
+    }
+  }
+
+  void _stop() {
+    final proc = _proc;
+    _proc = null;
+    proc?.kill();
+    if (mounted) {
+      setState(() {
+        _running = false;
+        _log.add('Stopped by user.');
+      });
+    }
+  }
+
+  Future<void> _installOllama() async {
+    final api = widget.api;
+    if (api == null) {
+      _say('Engine not running yet — start the engine first.');
+      return;
+    }
+    setState(() {
+      _ollamaBusy = true;
+      _message = 'Installing Ollama… downloading the official installer, '
+          'then installing silently. This can take a minute.';
+    });
+    try {
+      final res = await api.ollamaInstall();
+      if (res['already_installed'] == true) {
+        _say('Ollama is already installed '
+            '(${res['installed_version'] ?? 'unknown version'}) — '
+            'nothing to install.');
+      } else if (res['launched_gui'] == true) {
+        _say('Silent install could not be verified, so the installer '
+            'opened for a one-click install — finish it, then tap '
+            'Install Ollama again to verify.');
+      } else {
+        _say('Ollama installed and verified: ${res['installed_version']}');
+      }
+    } catch (e) {
+      _say('Ollama install failed: $e');
+    } finally {
+      if (mounted) setState(() => _ollamaBusy = false);
+    }
+  }
+
+  Future<void> _pullModel() async {
+    final api = widget.api;
+    if (api == null) {
+      _say('Engine not running yet — start the engine first.');
+      return;
+    }
+    final modelText = _modelText;
+    setState(() {
+      _ollamaBusy = true;
+      _message = 'Pulling $modelText… this downloads several GB and can '
+          'take a while. The result appears here when it finishes.';
+    });
+    try {
+      await api.ollamaPull(modelText);
+      _say('Model $modelText pulled and verified.');
+    } catch (e) {
+      _say('Model pull failed: $e');
+    } finally {
+      if (mounted) setState(() => _ollamaBusy = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final ollama = widget.ollama;
+    final noEngine = widget.api == null;
+    final models = (ollama?['models'] as List<dynamic>?) ?? [];
+    final ollamaSubtitle = ollama == null || ollama['version'] == null
+        ? 'Install Ollama, then pull the model below.'
+        : 'Version ${ollama['version']}'
+            '${models.isNotEmpty ? ' · models: ${models.join(', ')}' : ' · no models pulled yet'}';
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Expanded(
+          child: ListView(
+            padding: const EdgeInsets.all(16),
+            children: [
+              const Text(
+                'Local mode runs a vision model ON this PC (Ollama) that '
+                'operates the engine over loopback — no Tailscale needed '
+                'for this loop. Type a task, press Start, and watch the '
+                'log. Every action goes through the engine, so it lands '
+                'in the action log like any controller\'s.',
+                style: TextStyle(color: Colors.grey),
+              ),
+              if (noEngine) ...[
+                const SizedBox(height: 8),
+                const Card(
+                  child: ListTile(
+                    leading: Icon(Icons.info),
+                    title: Text('Engine not running yet'),
+                    subtitle: Text(
+                        'Local mode runs through the engine. Start the '
+                        'engine first — it launches from this app '
+                        'automatically.'),
+                  ),
+                ),
+              ],
+              const SizedBox(height: 12),
+              TextField(
+                controller: _task,
+                decoration: const InputDecoration(
+                  labelText: 'Task (for example: open the Start menu)',
+                  border: OutlineInputBorder(),
+                ),
+              ),
+              const SizedBox(height: 8),
+              TextField(
+                controller: _model,
+                decoration: const InputDecoration(
+                  labelText: 'Model (default qwen3-vl:8b)',
+                  border: OutlineInputBorder(),
+                ),
+              ),
+              const SizedBox(height: 8),
+              Row(children: [
+                Expanded(
+                  child: FilledButton(
+                    onPressed: (_running || noEngine) ? null : _start,
+                    child: const Text('Start'),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: OutlinedButton(
+                    onPressed: _running ? _stop : null,
+                    child: const Text('Stop'),
+                  ),
+                ),
+              ]),
+              const SizedBox(height: 16),
+              ListTile(
+                leading: const Icon(Icons.smart_toy),
+                title: Text(ollama == null
+                    ? 'Ollama status unknown'
+                    : ollama['installed'] == true
+                        ? 'Ollama installed'
+                        : 'Ollama not installed'),
+                subtitle: Text(ollamaSubtitle),
+              ),
+              Row(children: [
+                Expanded(
+                  child: FilledButton(
+                    onPressed:
+                        (_ollamaBusy || noEngine) ? null : _installOllama,
+                    child: const Text('Install Ollama'),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: OutlinedButton(
+                    onPressed: (_ollamaBusy || noEngine) ? null : _pullModel,
+                    child: const Text('Pull model'),
+                  ),
+                ),
+              ]),
+              if (_message != null) ...[
+                const SizedBox(height: 8),
+                Card(child: ListTile(title: Text(_message!))),
+              ],
+              const SizedBox(height: 16),
+              const Text('Operator log',
+                  style: TextStyle(fontWeight: FontWeight.bold)),
+              const SizedBox(height: 8),
+            ],
+          ),
+        ),
+        // Fixed-height log strip at the bottom so the controls above
+        // stay reachable while the log grows.
+        Container(
+          height: 200,
+          padding: const EdgeInsets.all(8),
+          color: Colors.black,
+          child: _log.isEmpty
+              ? const Text('No operator output yet.',
+                  style: TextStyle(color: Colors.grey))
+              : ListView.builder(
+                  itemCount: _log.length,
+                  itemBuilder: (context, i) => Text(
+                    _log[i],
+                    style: const TextStyle(
+                        fontFamily: 'monospace', fontSize: 12),
+                  ),
+                ),
+        ),
       ],
     );
   }

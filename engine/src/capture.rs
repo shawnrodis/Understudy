@@ -1,28 +1,28 @@
 //! Per-monitor screenshots.
 //!
 //! v1 capture uses Win32 GDI (`BitBlt` from the screen device context into
-//! a 32-bit DIB, converted BGRA -> RGBA) and encodes with the engine's own
-//! PNG encoder. It is real, per-monitor, and DPI-aware: the captured
-//! rectangle is the monitor's own rectangle in virtual-desktop physical
-//! pixels, so a 150%-scaled portrait panel yields a 2160x3840 image, not a
-//! scaled-down one.
+//! a 32-bit DIB, converted BGRA -> RGBA) and returns raw pixels. It is
+//! real, per-monitor, and DPI-aware: the captured rectangle is the
+//! monitor's own rectangle in virtual-desktop physical pixels, so a
+//! 150%-scaled portrait panel yields a 2160x3840 image, not a scaled-down
+//! one. The API layer encodes (PNG, or downscaled JPEG) from these
+//! pixels, so the capture path never round-trips through an encoding.
 //!
 //! Planned upgrade (documented, not claimed): DXGI Desktop Duplication for
 //! high-rate frame streaming. The `capture_monitor` signature already
 //! returns raw RGBA, so the duplication backend slots in behind it.
 
 use crate::monitors::Monitor;
-use crate::png;
 
-/// Capture monitor `id` and return `(width, height, rgba_png_bytes)`.
-pub fn capture_monitor_png(monitors: &[Monitor], id: u32) -> Result<(u32, u32, Vec<u8>), String> {
+/// Capture monitor `id` and return `(width, height, rgba_bytes)` without
+/// encoding — the downscale/JPEG path uses raw pixels directly instead
+/// of round-tripping through PNG.
+pub fn capture_monitor_rgba(monitors: &[Monitor], id: u32) -> Result<(u32, u32, Vec<u8>), String> {
     let monitor = monitors
         .iter()
         .find(|m| m.id == id)
         .ok_or_else(|| format!("unknown monitor {}", id))?;
-    let (w, h, rgba) = capture_rgba(monitor)?;
-    let png_bytes = png::encode_rgba(w, h, &rgba)?;
-    Ok((w, h, png_bytes))
+    capture_rgba(monitor)
 }
 
 #[cfg(windows)]

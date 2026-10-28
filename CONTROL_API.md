@@ -1,4 +1,4 @@
-# Understudy Control API — contract (v0.1.4)
+# Understudy Control API — contract (v0.1.5)
 
 This document is the complete contract for operating an Understudy-controlled
 PC. It is written so that a future Muse session can operate the PC through
@@ -92,7 +92,7 @@ Response:
 ```json
 {
   "ok": true,
-  "version": "0.1.4",
+  "version": "0.1.5",
   "bind": "tailscale-or-loopback",
   "monitors": 2,
   "uptime_s": 3600,
@@ -124,6 +124,16 @@ are physical pixels; `scale` is physical pixels per logical pixel.
 
 Returns a PNG of exactly that monitor (physical-pixel size). Example:
 `GET /monitors/1/screenshot` → PNG bytes, 2160×3840 for the desk above.
+
+Optional query params (defaults keep the historical PNG):
+- `format=png|jpeg` — `jpeg` returns a baseline JPEG (quality 80) instead
+  of PNG. Anything else → 400.
+- `width=<n>` — downscales to `n` pixels wide, aspect kept, box-averaged.
+  A value >= the native width means "no downscale", never an upscale;
+  0 or non-numeric → 400.
+- The on-PC local operator uses `?width=1280&format=jpeg` so each frame
+  is tens of KB instead of a ~15 MB raw PNG. Remote controllers asking
+  for plain PNG notice nothing.
 
 ### POST /input/move
 
@@ -282,7 +292,10 @@ no console window is ever shown). `version` may be omitted or empty:
 the engine then resolves the latest stable version from the stable
 package listing at `https://pkgs.tailscale.com/stable/` (its version
 dropdown's first versioned entry is the latest release — there is no
-`VERSION` file on that track). Success is only reported after the
+`VERSION` file on that track). If Tailscale is already installed, the
+endpoint does NOT re-download or reinstall: it returns
+`{"ok":true,"already_installed":true,"installed_version":"..."}`.
+Success is only reported after the
 install is verified (`tailscale.exe` present and answering
 `tailscale version`); the response carries the verified version.
 On non-Windows hosts this endpoint returns 501 — install Tailscale with
@@ -300,6 +313,50 @@ fails, the error says so plainly and asks for an explicit version.
   the browser SSO flow for the owner to complete once.
 - The key is passed only to the local `tailscale` binary and is never
   logged. Response: `{"ok":true,"login_started":true}`.
+
+### GET /ollama/status
+
+Whether Ollama is installed for local mode, its version, and the models
+currently pulled. Response:
+`{"ok":true,"installed":true,"version":"ollama version is 0.12.3","models":["qwen3-vl:8b"]}`.
+`installed` is false (with `version: null` and `models: []`) when the
+CLI is missing or does not answer.
+
+### POST /ollama/install
+
+```json
+{}
+```
+
+Downloads the official Windows installer
+(`https://ollama.com/download/OllamaSetup.exe`, Inno Setup) and runs it
+silently (`/VERYSILENT /SUPPRESSMSGBOXES /NORESTART`, no admin prompt
+— it is a per-user install). Success is only reported after
+verification (`ollama.exe` present and answering `ollama --version`).
+Outcomes:
+- Already installed → `{"ok":true,"already_installed":true,"installed_version":"..."}`,
+  no download.
+- Installed now → `{"ok":true,"installed_version":"..."}`.
+- Silent install unverified → `{"ok":true,"launched_gui":true}`: the
+  installer GUI opened for a one-click install; call this endpoint
+  again afterwards to verify.
+- Failure → 500 with the reason.
+On non-Windows hosts this endpoint returns an error — install Ollama
+with the host's package manager instead.
+
+### POST /ollama/pull
+
+```json
+{"model": "qwen3-vl:8b"}
+```
+
+Runs a hidden `ollama pull <model>` (blank or omitted model defaults to
+`qwen3-vl:8b`) and verifies afterwards via `ollama list`. This blocks
+for the download — multi-GB models take minutes — while the engine
+keeps serving other requests on other threads, so status polls keep
+working. Response: `{"ok":true,"pulled":true,"model":"qwen3-vl:8b"}`.
+Fails with 500 when Ollama is missing, the server is not running, or
+the model does not appear in `ollama list` afterwards.
 
 ### POST /auth/rotate
 
@@ -328,6 +385,38 @@ API-side kill switch. The Flutter app's Quit button calls this and then
 exits itself; ending the engine process directly has the same effect.
 Response: `{"ok":true,"shutting_down":true}` (best effort — the connection
 may close as the server stops).
+
+## Local operator (on-PC, no Tailscale)
+
+`local-operator.exe` ships with the installer and runs the same
+screenshot → think → act loop ON the PC, so no Tailscale is needed for
+it. It reads `connection.json` + `auth.token` from the engine's data
+dir (never the token on the command line) and uses the recorded ip+port
+verbatim, then loops:
+
+1. `GET /monitors`, pick the primary monitor (or `--monitor <id>`).
+2. `GET /monitors/{id}/screenshot?width=1280&format=jpeg`.
+3. `POST` the JPEG (base64, `images` array) to Ollama's `/api/chat`
+   (`http://localhost:11434`, `stream: false`, temperature 0.1,
+   `num_ctx` 8192) with the task prompt.
+4. Parse back exactly one JSON action and execute it through the engine
+   API (so it lands in the engine action log like any controller's):
+   `move` / `click` / `scroll` (with `delta`) / `type` (with `text`) /
+   `keys` (with `keys`) / `done` (with `reason`). x/y arrive normalized
+   0–1000 and are converted to that monitor's logical pixels using the
+   `/monitors` dimensions.
+5. Repeat until `done`, `--max-steps` (default 50), 3 consecutive failed
+   steps (screenshot / Ollama / unparseable action), or the process is
+   killed — the Flutter app's Stop button kills it immediately.
+
+CLI: `local-operator --task <task> [--data-dir <dir>]
+[--model <model>] [--ollama <url>] [--max-steps <n>] [--monitor <id>]`.
+Default model `qwen3-vl:8b` (fits a 12 GB card). At startup it checks
+Ollama answers `/api/tags` and the model is already pulled — it never
+auto-pulls; a missing model exits with an error telling the owner to
+pull it first (Flutter app's Local AI tab, or `ollama pull`).
+One log line per step goes to stdout (`step N: action -> ok`,
+`done: reason`, `error: ...`); the app shows these live.
 
 ## Error behavior
 
