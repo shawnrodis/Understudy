@@ -1,4 +1,4 @@
-# Understudy Control API — contract (v0.1.5)
+# Understudy Control API — contract (v0.1.6)
 
 This document is the complete contract for operating an Understudy-controlled
 PC. It is written so that a future Muse session can operate the PC through
@@ -92,7 +92,7 @@ Response:
 ```json
 {
   "ok": true,
-  "version": "0.1.5",
+  "version": "0.1.6",
   "bind": "tailscale-or-loopback",
   "monitors": 2,
   "uptime_s": 3600,
@@ -406,8 +406,13 @@ verbatim, then loops:
    0–1000 and are converted to that monitor's logical pixels using the
    `/monitors` dimensions.
 5. Repeat until `done`, `--max-steps` (default 50), 3 consecutive failed
-   steps (screenshot / Ollama / unparseable action), or the process is
-   killed — the Flutter app's Stop button kills it immediately.
+   steps (screenshot / chat / unparseable action — a failed chat call
+   retries once on the same screenshot before it counts), or the
+   process is killed — the Flutter app's Stop button kills it
+   immediately. Chat replies may arrive chunked (Ollama's server
+   switches framing above ~2 KB); the operator decodes that before
+   parsing, and a bad reply is logged with its status and the start of
+   the raw body instead of killing the run opaque.
 
 CLI: `local-operator --task <task> [--data-dir <dir>]
 [--model <model>] [--ollama <url>] [--max-steps <n>] [--monitor <id>]`.

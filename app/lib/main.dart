@@ -184,8 +184,16 @@ class UnderstudyApp extends StatelessWidget {
         cardTheme: const CardThemeData(color: Colors.black),
         dialogTheme: const DialogThemeData(backgroundColor: Colors.black),
         appBarTheme: const AppBarTheme(backgroundColor: Colors.black),
+        // Explicit item colors: the seeded dark color scheme's defaults
+        // rendered nearly invisible on true black (v0.1.5 field report:
+        // the whole bar was unreadable). Amber for the selected tab,
+        // light grey for the rest, on the true-black bar.
         bottomNavigationBarTheme: const BottomNavigationBarThemeData(
           backgroundColor: Colors.black,
+          selectedItemColor: Color(0xFFF59E0B),
+          unselectedItemColor: Colors.white70,
+          selectedLabelStyle: TextStyle(color: Color(0xFFF59E0B)),
+          unselectedLabelStyle: TextStyle(color: Colors.white70),
         ),
         snackBarTheme: const SnackBarThemeData(backgroundColor: Colors.black),
         inputDecorationTheme: const InputDecorationTheme(
@@ -207,7 +215,8 @@ class HomeScreen extends StatefulWidget {
   State<HomeScreen> createState() => _HomeScreenState();
 }
 
-class _HomeScreenState extends State<HomeScreen> with WindowListener {
+class _HomeScreenState extends State<HomeScreen>
+    with WindowListener, TrayListener {
   int _tab = 0;
   Process? _engine;
   ApiClient? _api;
@@ -231,6 +240,18 @@ class _HomeScreenState extends State<HomeScreen> with WindowListener {
   String? _updateMessage;
   bool _tokenRevealed = false;
   Timer? _poller;
+  // Tray setup diagnostics, shown on the Status tab. Tray failures
+  // used to be swallowed silently, which is how a dead menu shipped
+  // twice; every step of tray setup now leaves a visible line here.
+  final List<String> _trayLines = [];
+
+  void _trayLog(String line) {
+    if (!mounted) return;
+    setState(() {
+      _trayLines.add(line);
+      if (_trayLines.length > 10) _trayLines.removeAt(0);
+    });
+  }
 
   @override
   void initState() {
@@ -243,28 +264,46 @@ class _HomeScreenState extends State<HomeScreen> with WindowListener {
   }
 
   Future<void> _initTray() async {
+    // Root cause of the v0.1.5 field failure, found by reading the
+    // tray_manager 0.2.x Windows plugin: setContextMenu only BUILDS
+    // the menu (an HMENU stored in the plugin). Nothing in the plugin
+    // ever shows it on right-click — HandleWindowProc just forwards
+    // WM_RBUTTONUP as a Dart event. The app never listened for that
+    // event and never called popUpContextMenu, so right-clicking did
+    // nothing in every version. The v0.1.5 setContextMenu retry was
+    // fixing the wrong layer: the menu was always built fine.
+    // Fix: listen for the click events and pop the menu up explicitly.
+    trayManager.addListener(this);
+    _trayLog('Tray: listener attached (click the icon for Open/Quit).');
     // The icon and the menu are set independently on purpose: if the
     // icon fails, the menu — including Quit — must still exist. One
     // try block around both is how the Quit entry goes missing.
+    String? iconPath;
     try {
       final exeDir = File(Platform.resolvedExecutable).parent;
       // Installed layout first (icon.ico sits next to the exe), then
-      // the working directory as a fallback; absent is fine, skipped
-      // silently.
+      // the working directory as a fallback.
       for (final dir in [exeDir, Directory.current]) {
         final ico = File('${dir.path}/icon.ico');
         if (await ico.exists()) {
-          await trayManager.setIcon(ico.path);
+          iconPath = ico.path;
           break;
         }
       }
-    } catch (_) {
-      // Tray icon is a convenience; the app must work without it.
+      if (iconPath == null) {
+        _trayLog('Tray: no icon.ico next to the exe or in the working '
+            'directory — icon skipped, menu still set.');
+      } else {
+        await trayManager.setIcon(iconPath);
+        _trayLog('Tray: icon set from $iconPath.');
+      }
+    } catch (e) {
+      _trayLog('Tray: setIcon failed: $e');
     }
     // The menu MUST offer Open and Quit. A first-attempt failure (the
     // tray host not ready yet on a fresh launch) is retried once after
     // a short delay instead of silently leaving the icon menu-less.
-    for (var attempt = 0; attempt < 2; attempt++) {
+    for (var attempt = 1; attempt <= 2; attempt++) {
       try {
         await trayManager.setContextMenu(
           Menu(items: [
@@ -281,15 +320,31 @@ class _HomeScreenState extends State<HomeScreen> with WindowListener {
             ),
           ]),
         );
+        _trayLog('Tray: menu set (attempt $attempt).');
         break;
-      } catch (_) {
-        if (attempt == 0) {
+      } catch (e) {
+        _trayLog('Tray: setContextMenu failed (attempt $attempt): $e');
+        if (attempt == 1) {
           await Future.delayed(const Duration(milliseconds: 500));
         }
         // Without a menu there is no tray Quit; the in-app Quit button
         // on the Status tab remains the kill switch.
       }
     }
+  }
+
+  // tray_manager shows the menu only when asked: pop it up explicitly
+  // on both clicks. Right-click is the requested gesture; left-click
+  // previously did nothing, so it is a second path to the same menu,
+  // not a conflict with anything.
+  @override
+  void onTrayIconRightMouseDown() {
+    unawaited(trayManager.popUpContextMenu());
+  }
+
+  @override
+  void onTrayIconMouseDown() {
+    unawaited(trayManager.popUpContextMenu());
   }
 
   @override
@@ -460,13 +515,21 @@ class _HomeScreenState extends State<HomeScreen> with WindowListener {
     setState(() => _updateMessage = 'Downloading update…');
     try {
       final path = await downloadInstaller(info.downloadUrl, info.version);
+      final size = await File(path).length();
+      // Say exactly what was downloaded before quitting: if the
+      // installer then fails to appear, the path + size + the launch
+      // log in %TEMP% say where it went wrong.
+      setState(() => _updateMessage =
+          'Downloaded installer (${(size / 1048576).toStringAsFixed(1)} MB) '
+          '— launching it now; the app will quit so the installer can '
+          'replace its files.');
       await launchInstallerAfterQuit(path, pid);
       // The installer launches once this process exits; quitting now
       // is what lets it replace the running files.
       await _quit();
     } catch (e) {
       if (mounted) {
-        setState(() => _updateMessage = 'Download failed: $e');
+        setState(() => _updateMessage = 'Download or launch failed: $e');
       }
     }
   }
@@ -562,6 +625,7 @@ class _HomeScreenState extends State<HomeScreen> with WindowListener {
   void dispose() {
     _poller?.cancel();
     windowManager.removeListener(this);
+    trayManager.removeListener(this);
     super.dispose();
   }
 
@@ -613,6 +677,7 @@ class _HomeScreenState extends State<HomeScreen> with WindowListener {
                   updateMessage: _updateMessage,
                   onCheckUpdate: _manualUpdateCheck,
                   onDownloadInstall: _downloadAndInstall,
+                  trayLines: _trayLines,
                 ),
                 _LogTab(entries: _log),
                 _SetupTab(
@@ -664,6 +729,7 @@ class _StatusTab extends StatelessWidget {
     required this.updateMessage,
     required this.onCheckUpdate,
     required this.onDownloadInstall,
+    required this.trayLines,
   });
 
   final Map<String, dynamic>? status;
@@ -684,6 +750,7 @@ class _StatusTab extends StatelessWidget {
   final String? updateMessage;
   final VoidCallback onCheckUpdate;
   final VoidCallback onDownloadInstall;
+  final List<String> trayLines;
 
   @override
   Widget build(BuildContext context) {
@@ -759,6 +826,16 @@ class _StatusTab extends StatelessWidget {
             ),
           ],
         ]),
+        if (trayLines.isNotEmpty) ...[
+          const SizedBox(height: 8),
+          Card(
+            child: ListTile(
+              leading: const Icon(Icons.push_pin, size: 18),
+              title: const Text('Tray'),
+              subtitle: Text(trayLines.join('\n')),
+            ),
+          ),
+        ],
         const SizedBox(height: 8),
         Card(
           child: ListTile(

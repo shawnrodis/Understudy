@@ -14,7 +14,7 @@ import 'dart:io';
 import 'api_client.dart';
 
 /// Bump this with every release (it must match the release tag).
-const kAppVersion = '0.1.5';
+const kAppVersion = '0.1.6';
 
 const _repo = 'shawnrodis/Understudy';
 
@@ -60,6 +60,11 @@ Future<File> _stampFile() async {
 /// silent in that case. A manual check always returns an UpdateInfo
 /// (with [UpdateInfo.error] set when the check itself failed).
 Future<UpdateInfo?> checkForUpdate({bool manual = false}) async {
+  // The stamp records the last COMPLETED check. v0.1.5 stamped before
+  // checking, so a check that ran just before a release published (or
+  // that failed outright) still suppressed auto-checks for 24h — the
+  // user then saw no update offer and reasonably concluded the updater
+  // was broken. A failed or too-early check must not consume the day.
   if (!manual) {
     try {
       final stamp = await _stampFile();
@@ -71,7 +76,6 @@ Future<UpdateInfo?> checkForUpdate({bool manual = false}) async {
           return null;
         }
       }
-      await stamp.writeAsString(DateTime.now().toIso8601String());
     } catch (_) {
       // A broken stamp file must never block the check; fall through.
     }
@@ -96,6 +100,14 @@ Future<UpdateInfo?> checkForUpdate({bool manual = false}) async {
     final decoded = jsonDecode(body) as Map<String, dynamic>;
     final tag = (decoded['tag_name'] as String? ?? '').trim();
     final version = tag.startsWith('v') ? tag.substring(1) : tag;
+    // Only a completed check stamps: a failed check must not suppress
+    // the next launch's check for 24h (see above).
+    if (!manual) {
+      try {
+        await (await _stampFile())
+            .writeAsString(DateTime.now().toIso8601String());
+      } catch (_) {}
+    }
     final notes = decoded['body'] as String? ?? '';
     String downloadUrl = '';
     final assets = decoded['assets'] as List<dynamic>? ?? [];
@@ -141,7 +153,14 @@ Future<String> downloadInstaller(String url, String version) async {
         <int>[], (acc, chunk) => acc..addAll(chunk));
     final path =
         '${Directory.systemTemp.path}/Understudy_Setup_$version.exe';
-    await File(path).writeAsBytes(bytes);
+    final file = File(path);
+    await file.writeAsBytes(bytes);
+    // Never hand a missing or empty installer to the launcher: a
+    // truncated download used to sail through and then nothing
+    // happened, with no trace.
+    if (!await file.exists() || await file.length() == 0) {
+      throw Exception('Downloaded installer is empty or missing');
+    }
     return path;
   } finally {
     client.close();
@@ -154,7 +173,20 @@ String _psQuote(String s) => "'${s.replaceAll("'", "''")}'";
 /// for our PID to disappear, then starts the installer elevated (one
 /// UAC prompt, expected). The caller must quit immediately after this
 /// returns — the installer cannot replace files while this app runs.
+/// The script appends one outcome line to
+/// %TEMP%\Understudy_update_launch.log, so a launch that silently
+/// never happens is diagnosable instead of invisible.
 Future<void> launchInstallerAfterQuit(String installerPath, int pid) async {
+  final logPath =
+      '${Directory.systemTemp.path}\\Understudy_update_launch.log';
+  final script = '\$log = ${_psQuote(logPath)}; '
+      'Wait-Process -Id $pid -ErrorAction SilentlyContinue; '
+      'try { '
+      'Start-Process -FilePath ${_psQuote(installerPath)} -Verb RunAs; '
+      '"launched" | Out-File -Append -FilePath \$log; '
+      '} catch { '
+      '"FAILED to launch installer" | Out-File -Append -FilePath \$log; '
+      '}';
   await Process.start(
     'powershell.exe',
     [
@@ -162,8 +194,7 @@ Future<void> launchInstallerAfterQuit(String installerPath, int pid) async {
       '-WindowStyle',
       'Hidden',
       '-Command',
-      'Wait-Process -Id $pid -ErrorAction SilentlyContinue; '
-          'Start-Process -FilePath ${_psQuote(installerPath)} -Verb RunAs',
+      script,
     ],
     mode: ProcessStartMode.detached,
   );

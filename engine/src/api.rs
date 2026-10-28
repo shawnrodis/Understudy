@@ -26,7 +26,7 @@ use crate::auth::{bearer_token, tokens_equal};
 use crate::json::{self, quote, Value};
 use crate::{capture, cmd, files, input, jpeg, log, monitors, ollama, process, tailscale};
 
-pub const VERSION: &str = "0.1.5";
+pub const VERSION: &str = "0.1.6";
 
 /// Shared server state.
 pub struct State {

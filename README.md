@@ -30,6 +30,8 @@ This tool grants **full user-level control** of the PC it runs on. That is the p
 3. The engine stores its first-run pairing token in `%APPDATA%\Understudy\auth.token`. Copy it into the controller that will operate this PC (for Muse, hand it over in chat once). The app's Status screen shows the base URL too, and **Copy connection details for the AI** puts one paste-ready block on the clipboard — base URL, bearer token, the header to send, reachability, and the session workflow — so a controller never has to go hunting in `connection.json`. The Status screen can reveal the token again later, and rotate it if it ever leaks.
 4. Operate the PC through the API: see [CONTROL_API.md](CONTROL_API.md) for the complete contract.
 
+**Tray:** closing the window tucks the app into the system tray — click the tray icon (left or right) for **Open** and **Quit** (the kill switch, which stops the engine). The Status tab has a Tray section showing the setup diagnostics if the menu ever looks wrong.
+
 **Local mode (no Tailscale needed):** the app's **Local AI** tab runs a
 vision model ON this PC (Ollama) that operates the engine over
 loopback. Tap **Install Ollama**, then **Pull model**
@@ -45,8 +47,9 @@ operator").
 ## Updates
 
 The tray app checks the `shawnrodis/Understudy` GitHub Releases API on
-launch, at most once per 24h (throttled by a stamp file in the data
-dir), silently: no update and check failures show nothing. The Status
+launch, at most once per 24h (throttled by a stamp file recording the
+last completed check in the data dir), silently: no update shows
+nothing, and a failed check does not consume the day. The Status
 tab also has **Check for updates** for a manual check, which always
 reports its result. When a newer release exists, the Status tab shows
 its version and release notes with a **Download & install** button.
@@ -54,7 +57,8 @@ Nothing is ever installed silently: tapping it downloads the new
 installer, then quits this app (engine included) and launches the
 installer elevated — one UAC prompt, expected — so it can replace the
 running files. If the UAC prompt is declined, just relaunch the app and
-try again.
+try again. If the app quits but no installer appears, the delayed
+launch logs its outcome to `%TEMP%\Understudy_update_launch.log`.
 
 ## Architecture
 
@@ -78,7 +82,7 @@ The Linux VM cannot build Flutter Windows targets, so Windows builds run in GitH
 - **CI** (`ci.yml`): engine unit tests on Linux, engine type-check for the Windows target, Flutter analyze.
 - **Release** (`release-windows.yml`): on a version tag (or manual dispatch), builds the Rust engine and the Flutter app on `windows-latest`, stages them, builds the NSIS installer, uploads it as a workflow artifact, and attaches it to the GitHub release.
 
-To cut a release: `git tag v0.1.5 && git push origin v0.1.5` — the workflow builds the installer and attaches it to the release.
+To cut a release: `git tag v0.1.6 && git push origin v0.1.6` — the workflow builds the installer and attaches it to the release.
 
 To build the engine locally (any platform with Rust):
 

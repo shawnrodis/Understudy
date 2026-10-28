@@ -24,10 +24,13 @@
 //! process. The model is NOT auto-pulled: if it is missing, the run
 //! exits with a clear error telling the owner to pull it first.
 //!
-//! HTTP notes: both the engine and Ollama answer non-streaming
-//! requests with a Content-Length, so the client reads exactly that
-//! many bytes after the headers. Ollama's `/api/chat` with
+//! HTTP notes: responses may use Content-Length or chunked framing
+//! (Ollama's Go server switches to chunked above ~2 KB) — the client
+//! decodes both before parsing. Ollama's `/api/chat` with
 //! `stream: false` returns one JSON object, not a stream of lines.
+//! A failed chat call retries once on the same screenshot, then counts
+//! as a failed step; bad replies are logged with status + body snippet
+//! instead of exiting opaque.
 
 #[path = "../json.rs"]
 mod json;
@@ -113,25 +116,50 @@ fn http(
             None
         }
     });
-    let mut body_bytes = buf[header_end..].to_vec();
-    match content_length {
-        Some(len) => {
-            while body_bytes.len() < len {
-                match stream.read(&mut chunk) {
-                    Ok(0) => break,
-                    Ok(n) => body_bytes.extend_from_slice(&chunk[..n]),
-                    Err(e) => return Err(format!("response body read failed: {}", e)),
-                }
-            }
-            body_bytes.truncate(len);
+    // A chunked body is NOT JSON: it starts with a hex chunk-size
+    // line, which is exactly the "unexpected input at 0" the v0.1.5
+    // field run died on. Go's net/http (Ollama's server) sends a
+    // Content-Length only for small bodies and switches to chunked
+    // framing above ~2 KB — so step 1's short reply parsed fine and
+    // step 2's longer reply failed at position 0. Chunked framing
+    // must be decoded before anyone parses the body.
+    let chunked = headers.lines().any(|l| match l.split_once(':') {
+        Some((k, v)) => {
+            k.trim().eq_ignore_ascii_case("Transfer-Encoding")
+                && v.to_lowercase().contains("chunked")
         }
-        None => loop {
+        None => false,
+    });
+    let mut body_bytes = buf[header_end..].to_vec();
+    if chunked {
+        loop {
             match stream.read(&mut chunk) {
                 Ok(0) => break,
                 Ok(n) => body_bytes.extend_from_slice(&chunk[..n]),
                 Err(e) => return Err(format!("response body read failed: {}", e)),
             }
-        },
+        }
+        body_bytes = decode_chunked(&body_bytes)?;
+    } else {
+        match content_length {
+            Some(len) => {
+                while body_bytes.len() < len {
+                    match stream.read(&mut chunk) {
+                        Ok(0) => break,
+                        Ok(n) => body_bytes.extend_from_slice(&chunk[..n]),
+                        Err(e) => return Err(format!("response body read failed: {}", e)),
+                    }
+                }
+                body_bytes.truncate(len);
+            }
+            None => loop {
+                match stream.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => body_bytes.extend_from_slice(&chunk[..n]),
+                    Err(e) => return Err(format!("response body read failed: {}", e)),
+                }
+            },
+        }
     }
     Ok((status, body_bytes))
 }
@@ -140,6 +168,50 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack
         .windows(needle.len())
         .position(|w| w == needle)
+}
+
+/// Decode a chunked transfer-encoding body into its payload bytes.
+/// Chunk-size lines are hex, optionally with `;extension` suffixes;
+/// the terminating zero-size chunk's trailers (if any) are ignored.
+fn decode_chunked(data: &[u8]) -> Result<Vec<u8>, String> {
+    let mut out = Vec::new();
+    let mut pos = 0usize;
+    loop {
+        let rel = find_subslice(&data[pos..], b"\r\n")
+            .ok_or("chunked: missing chunk-size line")?;
+        let line_end = pos + rel;
+        let line = std::str::from_utf8(&data[pos..line_end])
+            .map_err(|_| "chunked: bad chunk-size encoding")?;
+        let size_str = line.split(';').next().unwrap_or("").trim();
+        let size = usize::from_str_radix(size_str, 16)
+            .map_err(|_| format!("chunked: bad chunk size {:?}", size_str))?;
+        pos = line_end + 2;
+        if size == 0 {
+            break;
+        }
+        if pos + size > data.len() {
+            return Err("chunked: truncated chunk".to_string());
+        }
+        out.extend_from_slice(&data[pos..pos + size]);
+        pos += size;
+        if data.len() < pos + 2 || &data[pos..pos + 2] != b"\r\n" {
+            return Err("chunked: missing CRLF after chunk".to_string());
+        }
+        pos += 2;
+    }
+    Ok(out)
+}
+
+/// First ~200 chars of a raw reply body, single-line, for error logs.
+/// A bad reply must never again be reported without showing what the
+/// server actually sent.
+fn snippet(body: &[u8]) -> String {
+    String::from_utf8_lossy(body)
+        .chars()
+        .take(200)
+        .collect::<String>()
+        .replace('\n', " ")
+        .replace('\r', "")
 }
 
 /// Base64 (standard alphabet, padded) for the JPEG → Ollama `images`
@@ -197,6 +269,54 @@ impl Engine {
             "application/json",
         )
     }
+}
+
+/// One /api/chat call: returns the message content, or a descriptive
+/// error that always says what the server actually sent — HTTP status
+/// plus Ollama's {"error": ...} field, or the first ~200 chars of the
+/// raw body when the reply is not parseable JSON. A bad reply used to
+/// surface as just "unexpected input at 0" and kill the run; it now
+/// carries the evidence with it.
+fn chat_step(ollama_host: &str, model: &str, prompt: &str, shot: &[u8]) -> Result<String, String> {
+    let chat_body = format!(
+        "{{\"model\":{},\"messages\":[{{\"role\":\"user\",\"content\":{},\"images\":[{}]}}],\"stream\":false,\"options\":{{\"temperature\":0.1,\"num_ctx\":8192}}}}",
+        json::quote(model),
+        json::quote(prompt),
+        json::quote(&base64(shot)),
+    );
+    let (st, chat) = http(
+        ollama_host,
+        "POST",
+        "/api/chat",
+        Some(chat_body.as_bytes()),
+        None,
+        "application/json",
+    )
+    .map_err(|e| format!("chat request failed: {}", e))?;
+    if st != 200 {
+        let msg = json::parse(&String::from_utf8_lossy(&chat))
+            .ok()
+            .and_then(|v| {
+                v.get("error")
+                    .and_then(Value::as_str)
+                    .map(|s| s.to_string())
+            })
+            .unwrap_or_else(|| snippet(&chat));
+        return Err(format!("ollama HTTP {}: {}", st, msg));
+    }
+    let reply = json::parse(&String::from_utf8_lossy(&chat)).map_err(|e| {
+        format!(
+            "bad /api/chat reply (HTTP 200): {}; body starts: {}",
+            e,
+            snippet(&chat)
+        )
+    })?;
+    Ok(reply
+        .get("message")
+        .and_then(|m| m.get("content"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string())
 }
 
 // ------------------------------------------------------------- actions
@@ -383,7 +503,7 @@ fn run() -> Result<(), String> {
         return Err(format!("Ollama at {} answered HTTP {}", ollama, st));
     }
     let tags = json::parse(&String::from_utf8_lossy(&tags_body))
-        .map_err(|e| format!("bad /api/tags reply: {}", e))?;
+        .map_err(|e| format!("bad /api/tags reply: {}; body starts: {}", e, snippet(&tags_body)))?;
     let have_model = tags
         .get("models")
         .and_then(Value::as_arr)
@@ -462,36 +582,33 @@ fn run() -> Result<(), String> {
             }
             continue;
         }
-        let chat_body = format!(
-            "{{\"model\":{},\"messages\":[{{\"role\":\"user\",\"content\":{},\"images\":[{}]}}],\"stream\":false,\"options\":{{\"temperature\":0.1,\"num_ctx\":8192}}}}",
-            json::quote(&model),
-            json::quote(&prompt),
-            json::quote(&base64(&shot)),
-        );
-        let (st, chat) = http(
-            &ollama_host,
-            "POST",
-            "/api/chat",
-            Some(chat_body.as_bytes()),
-            None,
-            "application/json",
-        )?;
-        if st != 200 {
-            failures += 1;
-            println!("step {}: ollama failed (HTTP {}), failure {}", step, st, failures);
-            if failures >= MAX_CONSECUTIVE_FAILURES {
-                return Err(format!("{} consecutive Ollama failures", failures));
+        // A failed chat call used to kill the run immediately (the
+        // `?` on the parse). It now retries once on the same fresh
+        // screenshot, and only then counts as a failed step — a
+        // transient Ollama hiccup no longer ends the task.
+        let content = match chat_step(&ollama_host, &model, &prompt, &shot) {
+            Ok(c) => c,
+            Err(e1) => {
+                println!("step {}: chat failed ({}), retrying once", step, e1);
+                match chat_step(&ollama_host, &model, &prompt, &shot) {
+                    Ok(c) => c,
+                    Err(e2) => {
+                        failures += 1;
+                        println!(
+                            "step {}: chat failed again ({}), failure {}",
+                            step, e2, failures
+                        );
+                        if failures >= MAX_CONSECUTIVE_FAILURES {
+                            return Err(format!(
+                                "{} consecutive chat failures",
+                                failures
+                            ));
+                        }
+                        continue;
+                    }
+                }
             }
-            continue;
-        }
-        let reply = json::parse(&String::from_utf8_lossy(&chat))
-            .map_err(|e| format!("bad /api/chat reply: {}", e))?;
-        let content = reply
-            .get("message")
-            .and_then(|m| m.get("content"))
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
+        };
         let action = match parse_action(&content) {
             Ok(a) => a,
             Err(e) => {
@@ -610,5 +727,52 @@ mod tests {
     fn normalized_conversion_clamps() {
         assert_eq!(normalized_to_pixels(500.0, 500.0, 2560.0, 1440.0), (1280.0, 720.0));
         assert_eq!(normalized_to_pixels(1200.0, -50.0, 2560.0, 1440.0), (2559.0, 0.0));
+    }
+
+    #[test]
+    fn chunked_decoding_matches_known_framing() {
+        // "Wikipedia" in two chunks, then the zero terminator.
+        let framed = b"4\r\nWiki\r\n5\r\npedia\r\n0\r\n\r\n";
+        assert_eq!(decode_chunked(framed).unwrap(), b"Wikipedia");
+    }
+
+    #[test]
+    fn chunked_decoding_tolerates_extensions_and_trailers() {
+        let framed = b"5;ext=1\r\nHello\r\n0\r\nX-Trailer: y\r\n\r\n";
+        assert_eq!(decode_chunked(framed).unwrap(), b"Hello");
+    }
+
+    #[test]
+    fn chunked_decoding_rejects_bad_frames() {
+        assert!(decode_chunked(b"zz\r\nabc\r\n0\r\n\r\n").is_err());
+        assert!(decode_chunked(b"5\r\nHi\r\n0\r\n\r\n").is_err());
+        assert!(decode_chunked(b"").is_err());
+    }
+
+    #[test]
+    fn chunked_ollama_envelope_parses_after_decode() {
+        // Regression test for the v0.1.5 field failure: a chat reply
+        // above Go's ~2 KB Content-Length threshold arrives chunked,
+        // and parsing the raw framing fails at position 0.
+        let envelope = r#"{"model":"qwen3-vl:8b","message":{"role":"assistant","content":"{\"action\":\"click\",\"x\":500,\"y\":250}"},"done":true}"#;
+        let framed = format!("{:x}\r\n{}\r\n0\r\n\r\n", envelope.len(), envelope);
+        assert!(json::parse(&String::from_utf8_lossy(framed.as_bytes())).is_err());
+        let decoded = decode_chunked(framed.as_bytes()).unwrap();
+        let v = json::parse(&String::from_utf8_lossy(&decoded)).unwrap();
+        let content = v
+            .get("message")
+            .and_then(|m| m.get("content"))
+            .and_then(Value::as_str)
+            .unwrap();
+        assert!(parse_action(content).is_ok());
+    }
+
+    #[test]
+    fn snippet_truncates_and_flattens() {
+        let long = "a".repeat(300);
+        let body = format!("{}\nsecond line", long);
+        let s = snippet(body.as_bytes());
+        assert_eq!(s.chars().count(), 200);
+        assert!(!s.contains('\n'));
     }
 }
