@@ -140,17 +140,25 @@ Future<UpdateInfo?> checkForUpdate({bool manual = false}) async {
 
 /// Download the installer to the temp dir; returns its full path.
 /// Throws on a non-200 response.
+/// Every stage has a real timeout: v0.1.5 set none, so a stalled
+/// download could sit forever with no outcome and no error — one of
+/// the live candidates for the "nothing happened at all" field report.
+/// A timeout surfaces as an error the UI shows, and the already
+/// downloaded file (if any) stays available via "Open installer".
 Future<String> downloadInstaller(String url, String version) async {
-  final client = HttpClient();
+  final client = HttpClient()
+    ..connectionTimeout = const Duration(seconds: 30);
   try {
     final req = await client.getUrl(Uri.parse(url));
     req.headers.set('User-Agent', 'Understudy');
-    final resp = await req.close();
+    final resp =
+        await req.close().timeout(const Duration(seconds: 60));
     if (resp.statusCode != 200) {
       throw Exception('Download failed (HTTP ${resp.statusCode})');
     }
-    final bytes = await resp.fold<List<int>>(
-        <int>[], (acc, chunk) => acc..addAll(chunk));
+    final bytes = await resp
+        .fold<List<int>>(<int>[], (acc, chunk) => acc..addAll(chunk))
+        .timeout(const Duration(minutes: 5));
     final path =
         '${Directory.systemTemp.path}/Understudy_Setup_$version.exe';
     final file = File(path);
@@ -173,17 +181,24 @@ String _psQuote(String s) => "'${s.replaceAll("'", "''")}'";
 /// for our PID to disappear, then starts the installer elevated (one
 /// UAC prompt, expected). The caller must quit immediately after this
 /// returns — the installer cannot replace files while this app runs.
-/// The script appends one outcome line to
-/// %TEMP%\Understudy_update_launch.log, so a launch that silently
-/// never happens is diagnosable instead of invisible.
+///
+/// The watcher used to leave zero trace: if it died, or Start-Process
+/// failed, the app had already quit and nothing ever appeared. It now
+/// appends a staged trace to %TEMP%\Understudy_update_launch.log
+/// (waiting → app exited / wait timed out → launched / FAILED), and
+/// the wait is bounded at 60s: if this app somehow never exits, the
+/// installer still appears (NSIS will say the files are in use, which
+/// is a visible problem instead of a silent one).
 Future<void> launchInstallerAfterQuit(String installerPath, int pid) async {
   final logPath =
       '${Directory.systemTemp.path}\\Understudy_update_launch.log';
   final script = '\$log = ${_psQuote(logPath)}; '
-      'Wait-Process -Id $pid -ErrorAction SilentlyContinue; '
+      '"waiting for app $pid to exit" | Out-File -Append -FilePath \$log; '
+      'Wait-Process -Id $pid -Timeout 60 -ErrorAction SilentlyContinue; '
+      '"app exited (or wait timed out), starting installer" | Out-File -Append -FilePath \$log; '
       'try { '
       'Start-Process -FilePath ${_psQuote(installerPath)} -Verb RunAs; '
-      '"launched" | Out-File -Append -FilePath \$log; '
+      '"launched installer" | Out-File -Append -FilePath \$log; '
       '} catch { '
       '"FAILED to launch installer" | Out-File -Append -FilePath \$log; '
       '}';
@@ -198,4 +213,19 @@ Future<void> launchInstallerAfterQuit(String installerPath, int pid) async {
     ],
     mode: ProcessStartMode.detached,
   );
+}
+
+/// Path of the installer for [version] if it is already downloaded in
+/// %TEMP% and non-empty, else null. Lets the UI offer "Open installer"
+/// for a download that already succeeded — e.g. after a relaunch
+/// following a delayed launch that never produced a window — instead
+/// of re-downloading or sending the owner to GitHub.
+Future<String?> downloadedInstallerPath(String version) async {
+  final path =
+      '${Directory.systemTemp.path}/Understudy_Setup_$version.exe';
+  final file = File(path);
+  if (await file.exists() && await file.length() > 0) {
+    return path;
+  }
+  return null;
 }

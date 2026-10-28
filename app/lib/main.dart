@@ -238,6 +238,10 @@ class _HomeScreenState extends State<HomeScreen>
   UpdateInfo? _update;
   bool _updateChecking = false;
   String? _updateMessage;
+  // Installer already downloaded to %TEMP% for the pending update, if
+  // any. Powers the "Open installer" fallback: a download that
+  // succeeded once must never force a re-download or a GitHub trip.
+  String? _downloadedInstallerPath;
   bool _tokenRevealed = false;
   Timer? _poller;
   // Tray setup diagnostics, shown on the Status tab. Tray failures
@@ -484,7 +488,17 @@ class _HomeScreenState extends State<HomeScreen>
     if (!mounted) return;
     if (info != null && info.available) {
       setState(() => _update = info);
+      await _refreshDownloadedInstaller(info.version);
     }
+  }
+
+  /// If the installer for [version] is already in %TEMP% (downloaded
+  /// earlier this session or before a relaunch), remember it so the
+  /// Status tab can offer "Open installer" without re-downloading.
+  Future<void> _refreshDownloadedInstaller(String version) async {
+    final path = await downloadedInstallerPath(version);
+    if (!mounted) return;
+    setState(() => _downloadedInstallerPath = path);
   }
 
   Future<void> _manualUpdateCheck() async {
@@ -507,29 +521,82 @@ class _HomeScreenState extends State<HomeScreen>
         _updateMessage = 'You are up to date (v$kAppVersion).';
       }
     });
+    if (info != null && info.available) {
+      await _refreshDownloadedInstaller(info.version);
+    }
   }
 
   Future<void> _downloadAndInstall() async {
     final info = _update;
-    if (info == null || info.downloadUrl.isEmpty) return;
-    setState(() => _updateMessage = 'Downloading update…');
+    // Stage instrumentation for the v0.1.6 field failure ("nothing
+    // happened at all" after pressing Download & install): every stage
+    // reports visibly, and NO path returns silently. The stages are
+    // what distinguish the three candidates next time — silent early
+    // return (no stage-0 message), hung download (stuck on stage 1),
+    // failed launch (stages 0–2 shown, no installer), handler never
+    // running (no message of any kind, pointing at wiring, not here).
+    if (info == null) {
+      setState(() => _updateMessage = 'No update is selected.');
+      return;
+    }
+    if (info.downloadUrl.isEmpty) {
+      // Previously a silent return — the ONLY silent exit in this
+      // handler, before the first setState, so a press with an empty
+      // URL looked exactly like a dead button.
+      setState(() => _updateMessage =
+          'No installer download is available for this update '
+          '(the release has no .exe asset).');
+      return;
+    }
+    setState(() => _updateMessage =
+        'Stage 1: downloading update from ${info.downloadUrl}…');
     try {
       final path = await downloadInstaller(info.downloadUrl, info.version);
       final size = await File(path).length();
-      // Say exactly what was downloaded before quitting: if the
-      // installer then fails to appear, the path + size + the launch
-      // log in %TEMP% say where it went wrong.
-      setState(() => _updateMessage =
-          'Downloaded installer (${(size / 1048576).toStringAsFixed(1)} MB) '
-          '— launching it now; the app will quit so the installer can '
-          'replace its files.');
+      setState(() {
+        _downloadedInstallerPath = path;
+        _updateMessage =
+            'Stage 2: downloaded installer (${(size / 1048576).toStringAsFixed(1)} MB) '
+            'to $path — launching it now; the app will quit so the '
+            'installer can replace its files.';
+      });
       await launchInstallerAfterQuit(path, pid);
+      setState(() => _updateMessage =
+          'Stage 3: installer launch requested — quitting now so it '
+          'can run.');
       // The installer launches once this process exits; quitting now
       // is what lets it replace the running files.
       await _quit();
     } catch (e) {
       if (mounted) {
-        setState(() => _updateMessage = 'Download or launch failed: $e');
+        final detail = e is TimeoutException
+            ? 'Download timed out — check the connection and try again, '
+                'or use Open installer if a file was already downloaded.'
+            : '$e';
+        setState(() => _updateMessage = 'Download or launch failed: $detail');
+      }
+    }
+  }
+
+  /// Launch the already-downloaded installer directly, without the
+  /// delayed PowerShell watcher. The fallback for a delayed launch
+  /// that never produced a window: the file is already on disk, so
+  /// one tap runs it (NSIS will ask to close this app first if it
+  /// needs to replace running files — that prompt is visible, which
+  /// is the point). It also survives a relaunch: the Status tab
+  /// re-discovers the %TEMP% file whenever an update is known.
+  Future<void> _openDownloadedInstaller() async {
+    final path = _downloadedInstallerPath;
+    if (path == null) return;
+    try {
+      await Process.start(path, [], mode: ProcessStartMode.detached);
+      if (mounted) {
+        setState(
+            () => _updateMessage = 'Installer launched from $path.');
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(() => _updateMessage = 'Could not open installer: $e');
       }
     }
   }
@@ -617,7 +684,13 @@ class _HomeScreenState extends State<HomeScreen>
     try {
       _engine?.kill();
     } catch (_) {}
-    await windowManager.setPreventClose(false);
+    // exit(0) below must run no matter what: a throwing
+    // setPreventClose used to be able to strand the app alive, which
+    // also stranded the delayed installer (it waits for this process
+    // to disappear, so a stranded app meant no installer, ever).
+    try {
+      await windowManager.setPreventClose(false);
+    } catch (_) {}
     exit(0);
   }
 
@@ -677,6 +750,8 @@ class _HomeScreenState extends State<HomeScreen>
                   updateMessage: _updateMessage,
                   onCheckUpdate: _manualUpdateCheck,
                   onDownloadInstall: _downloadAndInstall,
+                  downloadedInstallerPath: _downloadedInstallerPath,
+                  onOpenInstaller: _openDownloadedInstaller,
                   trayLines: _trayLines,
                 ),
                 _LogTab(entries: _log),
@@ -729,6 +804,8 @@ class _StatusTab extends StatelessWidget {
     required this.updateMessage,
     required this.onCheckUpdate,
     required this.onDownloadInstall,
+    required this.downloadedInstallerPath,
+    required this.onOpenInstaller,
     required this.trayLines,
   });
 
@@ -750,6 +827,8 @@ class _StatusTab extends StatelessWidget {
   final String? updateMessage;
   final VoidCallback onCheckUpdate;
   final VoidCallback onDownloadInstall;
+  final String? downloadedInstallerPath;
+  final VoidCallback onOpenInstaller;
   final List<String> trayLines;
 
   @override
@@ -823,6 +902,14 @@ class _StatusTab extends StatelessWidget {
               onPressed: onDownloadInstall,
               icon: const Icon(Icons.download),
               label: const Text('Download & install'),
+            ),
+          ],
+          if (downloadedInstallerPath != null) ...[
+            const SizedBox(width: 8),
+            OutlinedButton.icon(
+              onPressed: onOpenInstaller,
+              icon: const Icon(Icons.open_in_new),
+              label: const Text('Open installer'),
             ),
           ],
         ]),

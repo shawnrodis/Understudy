@@ -58,7 +58,11 @@ installer, then quits this app (engine included) and launches the
 installer elevated — one UAC prompt, expected — so it can replace the
 running files. If the UAC prompt is declined, just relaunch the app and
 try again. If the app quits but no installer appears, the delayed
-launch logs its outcome to `%TEMP%\Understudy_update_launch.log`.
+launch logs its outcome to `%TEMP%\Understudy_update_launch.log`
+(waiting → app exited / wait timed out → launched / FAILED). And a
+failed launch never means a trip to GitHub: once an installer is
+downloaded, the Status tab keeps an **Open installer** button for the
+file already in `%TEMP%`, including after a relaunch.
 
 ## Architecture
 
