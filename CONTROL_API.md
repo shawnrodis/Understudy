@@ -1,4 +1,4 @@
-# Understudy Control API — contract (v0.1.6)
+# Understudy Control API — contract (v0.1.7)
 
 This document is the complete contract for operating an Understudy-controlled
 PC. It is written so that a future Muse session can operate the PC through
@@ -92,7 +92,7 @@ Response:
 ```json
 {
   "ok": true,
-  "version": "0.1.6",
+  "version": "0.1.7",
   "bind": "tailscale-or-loopback",
   "monitors": 2,
   "uptime_s": 3600,
@@ -252,6 +252,20 @@ Returns the most recent action-log entries (newest last, default 100, max
 Auth keys are never in `detail` (login entries record only whether a key
 was supplied); tokens and file contents are never logged.
 
+### POST /log/note
+
+Appends an operator note to the action log (for the local operator's
+parse failures, so the raw model text is visible in the Action log tab
+alongside executed actions):
+
+```json
+{"text": "unparseable action (bad action JSON: ...): <raw model text, capped at 500 chars>"}
+```
+
+The stored entry is `action: "operator-note"` — never an executed input —
+so it cannot masquerade as an action. The text is capped server-side at
+500 chars.
+
 ### GET /tailscale/status
 
 ```json
@@ -395,20 +409,33 @@ it. It reads `connection.json` + `auth.token` from the engine's data
 dir (never the token on the command line) and uses the recorded ip+port
 verbatim, then loops:
 
-1. `GET /monitors`, pick the primary monitor (or `--monitor <id>`).
+1. `GET /monitors`, pick the monitor flagged primary (never a fixed id
+   — Windows enumeration order shifts between runs, which is why one
+   run logged monitor 0 and another monitor 1 for the same panel), or
+   `--monitor <id>`.
 2. `GET /monitors/{id}/screenshot?width=1280&format=jpeg`.
 3. `POST` the JPEG (base64, `images` array) to Ollama's `/api/chat`
    (`http://localhost:11434`, `stream: false`, temperature 0.1,
-   `num_ctx` 8192) with the task prompt.
+   `num_ctx` 8192) with the task prompt. The prompt names the
+   screenshot's monitor id and logical size, demands ONLY a single JSON
+   object (no prose, no fences, no trailing text), and nudges system
+   operations (Start, desktop, window switching) toward a `keys`
+   action instead of a grounded click.
 4. Parse back exactly one JSON action and execute it through the engine
    API (so it lands in the engine action log like any controller's):
    `move` / `click` / `scroll` (with `delta`) / `type` (with `text`) /
    `keys` (with `keys`) / `done` (with `reason`). x/y arrive normalized
-   0–1000 and are converted to that monitor's logical pixels using the
-   `/monitors` dimensions.
+   0–1000 and are converted to that monitor's LOGICAL pixels
+   (`/monitors` width/height are physical — divide by `scale` first).
+   Pointer actions always execute on the screenshotted monitor: the
+   model only ever sees that one screenshot, so its coordinates are
+   meaningless anywhere else, and its `monitor` field is logged, not
+   followed (a click routed to the wrong screen used to report "ok"
+   while doing nothing visible).
 5. Repeat until `done`, `--max-steps` (default 50), 3 consecutive failed
    steps (screenshot / chat / unparseable action — a failed chat call
-   retries once on the same screenshot before it counts), or the
+   retries once on the same screenshot before it counts, and a reply
+   cut off mid-object retries the chat once before it counts), or the
    process is killed — the Flutter app's Stop button kills it
    immediately. Chat replies may arrive chunked (Ollama's server
    switches framing above ~2 KB); the operator decodes that before
@@ -421,8 +448,14 @@ Default model `qwen3-vl:8b` (fits a 12 GB card). At startup it checks
 Ollama answers `/api/tags` and the model is already pulled — it never
 auto-pulls; a missing model exits with an error telling the owner to
 pull it first (Flutter app's Local AI tab, or `ollama pull`).
-One log line per step goes to stdout (`step N: action -> ok`,
-`done: reason`, `error: ...`); the app shows these live.
+One log line per step goes to stdout; the app shows these live.
+Executed actions log their full details (`step N: click monitor 1
+x=340 y=986 px=(870,1420) origin=(0,0) -> ok`, type text, keys list),
+and parse failures log the raw model text (truncated to ~500 chars)
+both to stdout and to the engine action log via `POST /log/note`,
+so a "click ok" that achieves nothing still says exactly where it
+clicked, and a bad action still shows what the model actually
+returned.
 
 ## Error behavior
 

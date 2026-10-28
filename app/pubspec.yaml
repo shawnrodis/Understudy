@@ -1,6 +1,6 @@
 name: understudy
 description: Understudy — monitor and control the Understudy engine on your own PC. The engine's control API is the primary interface; this app shows status, the action log, and the kill switch, and walks Tailscale setup.
-version: 0.1.6+7
+version: 0.1.7+8
 publish_to: none
 
 environment:

@@ -26,7 +26,7 @@ use crate::auth::{bearer_token, tokens_equal};
 use crate::json::{self, quote, Value};
 use crate::{capture, cmd, files, input, jpeg, log, monitors, ollama, process, tailscale};
 
-pub const VERSION: &str = "0.1.6";
+pub const VERSION: &str = "0.1.7";
 
 /// Shared server state.
 pub struct State {
@@ -539,6 +539,24 @@ fn route(state: &Arc<State>, req: &Request) -> Response {
                 .collect();
             ok_json(&format!("\"entries\":[{}]", items.join(",")))
         }
+        ("POST", "/log/note") => {
+            // Operator-support note: lets the local operator record a
+            // parse failure (with the raw model text) in the engine
+            // action log, where the app's Action log tab shows it. The
+            // entry is action "operator-note" — never an executed
+            // input — so it cannot masquerade as an action. The text
+            // is capped server-side so one note cannot bloat the log.
+            // Like every endpoint here, this one is authenticated by
+            // the caller; the generic request log also records it.
+            let body = match req.json_body() {
+                Ok(b) => b,
+                Err(e) => return err(400, &e),
+            };
+            let text = body.get("text").and_then(Value::as_str).unwrap_or("");
+            let capped: String = text.chars().take(500).collect();
+            log::append(&state.data_dir, "operator-note", false, &capped);
+            ok_json("\"noted\":true")
+        }
         ("GET", "/tailscale/status") => {
             let s = tailscale::status();
             ok_json(&format!(
@@ -892,5 +910,39 @@ mod tests {
             Some("C:\\x.txt".to_string())
         );
         assert_eq!(query_param("path=C%3A%5Cx.txt", "limit"), None);
+    }
+
+    #[test]
+    fn log_note_appends_operator_note_entry() {
+        let dir =
+            std::env::temp_dir().join(format!("understudy-note-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let state = Arc::new(State::new(dir.clone(), "t".to_string(), vec![]));
+        let req = Request {
+            method: "POST".to_string(),
+            path: "/log/note".to_string(),
+            query: String::new(),
+            headers: vec![],
+            body: "{\"text\":\"unparseable action (x): raw\"}".to_string(),
+        };
+        let resp = route(&state, &req);
+        assert_eq!(resp.status, 200);
+        let logged = std::fs::read_to_string(dir.join("actions.log")).unwrap();
+        assert!(logged.contains("\"action\":\"operator-note\""));
+        assert!(logged.contains("unparseable action"));
+        // Server-side cap: a 600-char note is stored truncated to 500.
+        let long = "a".repeat(600);
+        let req = Request {
+            method: "POST".to_string(),
+            path: "/log/note".to_string(),
+            query: String::new(),
+            headers: vec![],
+            body: format!("{{\"text\":{}}}", quote(&long)),
+        };
+        assert_eq!(route(&state, &req).status, 200);
+        let logged = std::fs::read_to_string(dir.join("actions.log")).unwrap();
+        assert!(logged.contains(&"a".repeat(500)));
+        assert!(!logged.contains(&"a".repeat(501)));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

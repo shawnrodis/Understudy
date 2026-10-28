@@ -138,6 +138,7 @@ Endpoints:
   POST /input/move /input/click /input/scroll /input/type /input/keys
        /apps/launch /apps/kill /files/upload /cmd /tailscale/install
        /tailscale/login /ollama/install /ollama/pull /auth/rotate /shutdown
+       /log/note
 Screenshot query params (optional; defaults keep the historical PNG):
   format=png|jpeg, width=<n> downscales to n wide, aspect kept, never
   an upscale. The on-PC local operator uses format=jpeg&width=1280.

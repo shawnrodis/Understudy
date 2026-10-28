@@ -31,6 +31,18 @@
 //! A failed chat call retries once on the same screenshot, then counts
 //! as a failed step; bad replies are logged with status + body snippet
 //! instead of exiting opaque.
+//!
+//! Parse failures are diagnosable, not opaque: the raw model text is
+//! logged (operator stdout, truncated to ~500 chars, and POSTed to the
+//! engine's /log/note so it also lands in the engine action log), a
+//! reply cut off mid-object (unbalanced braces) retries the chat once
+//! instead of counting truncated garbage, and every executed action is
+//! logged with its full details (monitor, normalized + logical
+//! coordinates, origin) — a "click -> ok" that achieves nothing must
+//! still say exactly where it clicked. Pointer actions always execute
+//! on the screenshotted monitor: the model only ever sees that one
+//! screenshot, so its coordinates are meaningless anywhere else, and
+//! its monitor field is logged, not followed.
 
 #[path = "../json.rs"]
 mod json;
@@ -319,6 +331,16 @@ fn chat_step(ollama_host: &str, model: &str, prompt: &str, shot: &[u8]) -> Resul
         .to_string())
 }
 
+/// Best-effort: record a parse failure in the engine action log (as
+/// an "operator-note" entry, never an executed input) so it is visible
+/// in the app's Action log tab, not just this process's stdout.
+/// Failures to post the note are ignored — logging must never fail
+/// the step itself.
+fn note_parse_failure(engine: &Engine, detail: &str) {
+    let body = format!("{{\"text\":{}}}", json::quote(detail));
+    let _ = engine.post_json("/log/note", &body);
+}
+
 // ------------------------------------------------------------- actions
 
 /// One parsed model action. x/y arrive normalized (0–1000) and are
@@ -333,48 +355,117 @@ enum Action {
     Done { reason: String },
 }
 
-/// Parse the model's action JSON. Tolerates ```json fences and a
-/// surrounding prose wrapper (the first `{...}` wins). Returns an
-/// error string on anything malformed — the caller counts it as a
-/// failed step.
-fn parse_action(text: &str) -> Result<Action, String> {
+/// Why an action parse failed. Truncated means the reply was cut off
+/// mid-object (unbalanced braces) — worth one fresh chat retry, since
+/// the model never finished its answer. Anything else is Invalid: the
+/// model produced a complete object that is not a valid action.
+#[derive(Debug, PartialEq)]
+enum ParseFail {
+    Truncated(String),
+    Invalid(String),
+}
+
+impl ParseFail {
+    fn message(&self) -> &str {
+        match self {
+            ParseFail::Truncated(m) | ParseFail::Invalid(m) => m,
+        }
+    }
+}
+
+/// Parse the model's action JSON. Tolerates fences and prose wrappers
+/// (a fenced block anywhere wins; else the first `{...}` object), but
+/// validation is strict afterwards: the action must be known,
+/// coordinates must be numbers (clamped to 0–1000), and `type`/`keys`
+/// must carry non-empty payloads. Anything failing validation is a
+/// failed step and is NEVER executed — tolerance covers the wrapping,
+/// never the action itself.
+fn parse_action(text: &str) -> Result<Action, ParseFail> {
     let cleaned = strip_fences(text.trim());
-    let json_text = extract_json_object(&cleaned).ok_or("no JSON object in model reply")?;
-    let v = json::parse(&json_text).map_err(|e| format!("bad action JSON: {}", e))?;
-    let action = v
-        .get("action")
-        .and_then(Value::as_str)
-        .ok_or("action JSON has no 'action' field")?;
-    let monitor = v.get("monitor").and_then(Value::as_f64).unwrap_or(0.0) as u32;
-    let x = v.get("x").and_then(Value::as_f64).unwrap_or(0.0);
-    let y = v.get("y").and_then(Value::as_f64).unwrap_or(0.0);
+    let json_text = match extract_json_object(&cleaned) {
+        Extracted::Found(s) => s,
+        Extracted::NoBrace => {
+            return Err(ParseFail::Invalid(
+                "no JSON object in model reply".to_string(),
+            ))
+        }
+        Extracted::Unbalanced => {
+            return Err(ParseFail::Truncated(
+                "model reply ends mid-object (unbalanced braces)".to_string(),
+            ))
+        }
+    };
+    let v = json::parse(&json_text)
+        .map_err(|e| ParseFail::Invalid(format!("bad action JSON: {}", e)))?;
+    let action = v.get("action").and_then(Value::as_str).ok_or_else(|| {
+        ParseFail::Invalid("action JSON has no 'action' field".to_string())
+    })?;
+    // The model's monitor field is parsed (and validated when present)
+    // but the caller executes pointer actions on the screenshotted
+    // monitor: the model only ever sees that one screenshot, so its
+    // coordinates are meaningless anywhere else. See run().
+    let monitor = match v.get("monitor") {
+        None => 0,
+        Some(m) => m.as_f64().ok_or_else(|| {
+            ParseFail::Invalid("action 'monitor' must be a number".to_string())
+        })? as u32,
+    };
+    let coord = |key: &str| -> Result<f64, ParseFail> {
+        let n = v.get(key).and_then(Value::as_f64).ok_or_else(|| {
+            ParseFail::Invalid(format!("action '{}' must be a number", key))
+        })?;
+        Ok(n.clamp(0.0, 1000.0))
+    };
     match action {
-        "move" => Ok(Action::Move { monitor, x, y }),
-        "click" => Ok(Action::Click { monitor, x, y }),
+        "move" => Ok(Action::Move {
+            monitor,
+            x: coord("x")?,
+            y: coord("y")?,
+        }),
+        "click" => Ok(Action::Click {
+            monitor,
+            x: coord("x")?,
+            y: coord("y")?,
+        }),
         "scroll" => Ok(Action::Scroll {
             monitor,
-            x,
-            y,
+            x: coord("x")?,
+            y: coord("y")?,
             delta: v.get("delta").and_then(Value::as_f64).unwrap_or(0.0) as i64,
         }),
-        "type" => Ok(Action::Type {
-            text: v
-                .get("text")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string(),
-        }),
+        "type" => {
+            let text = v.get("text").and_then(Value::as_str).ok_or_else(|| {
+                ParseFail::Invalid("type action needs a 'text' string".to_string())
+            })?;
+            if text.is_empty() {
+                return Err(ParseFail::Invalid(
+                    "type action needs non-empty 'text'".to_string(),
+                ));
+            }
+            Ok(Action::Type {
+                text: text.to_string(),
+            })
+        }
         "keys" => {
-            let keys = v
-                .get("keys")
-                .and_then(Value::as_arr)
-                .map(|a| {
-                    a.iter()
-                        .filter_map(Value::as_str)
-                        .map(|s| s.to_string())
-                        .collect()
-                })
-                .unwrap_or_default();
+            let arr = v.get("keys").and_then(Value::as_arr).ok_or_else(|| {
+                ParseFail::Invalid("keys action needs a 'keys' array".to_string())
+            })?;
+            if arr.is_empty() {
+                return Err(ParseFail::Invalid(
+                    "keys action needs a non-empty 'keys' array".to_string(),
+                ));
+            }
+            let mut keys = Vec::new();
+            for k in arr {
+                match k.as_str() {
+                    Some(s) => keys.push(s.to_string()),
+                    None => {
+                        return Err(ParseFail::Invalid(
+                            "keys array must contain only strings".to_string(),
+                        ))
+                    }
+                }
+            }
             Ok(Action::Keys { keys })
         }
         "done" => Ok(Action::Done {
@@ -384,36 +475,122 @@ fn parse_action(text: &str) -> Result<Action, String> {
                 .unwrap_or("")
                 .to_string(),
         }),
-        other => Err(format!("unknown action: {}", other)),
+        other => Err(ParseFail::Invalid(format!("unknown action: {}", other))),
     }
 }
 
+/// Remove markdown fences around the action object, wherever they sit:
+/// a ```json ... ``` block anywhere wins; else a bare ``` ... ```
+/// block; else the whole text (leading/trailing prose is handled by
+/// extraction). A reply cut off inside a fence still yields its
+/// partial object, which extraction reports as Unbalanced.
 fn strip_fences(text: &str) -> String {
-    let t = text.strip_prefix("```json").unwrap_or(text);
-    let t = t.strip_prefix("```").unwrap_or(t);
-    let t = t.strip_suffix("```").unwrap_or(t);
-    t.trim().to_string()
+    if let Some(start) = text.find("```json") {
+        let after = &text[start + 7..];
+        if let Some(end) = after.find("```") {
+            return after[..end].trim().to_string();
+        }
+        return after.trim().to_string();
+    }
+    if let Some(start) = text.find("```") {
+        let after = &text[start + 3..];
+        if let Some(end) = after.find("```") {
+            return after[..end].trim().to_string();
+        }
+        return after.trim().to_string();
+    }
+    text.trim().to_string()
 }
 
-/// First balanced `{...}` in the text, by brace depth (strings are
-/// not tracked — action JSON has no braces inside string values in
-/// practice, and a malformed reply is a failed step, not a crash).
-fn extract_json_object(text: &str) -> Option<String> {
-    let start = text.find('{')?;
+/// What the first-`{...}` search found. NoBrace = no object at all
+/// (the model answered in prose); Unbalanced = an object starts but
+/// never closes (a truncated reply).
+#[derive(Debug, PartialEq)]
+enum Extracted {
+    Found(String),
+    NoBrace,
+    Unbalanced,
+}
+
+/// First balanced `{...}` in the text. String-aware: braces inside
+/// quoted strings (with `\"` escapes) do not affect depth, so a
+/// `type` text containing braces cannot break the span. Only the
+/// first object is returned; trailing text after it is ignored.
+fn extract_json_object(text: &str) -> Extracted {
+    let start = match text.find('{') {
+        Some(i) => i,
+        None => return Extracted::NoBrace,
+    };
+    let bytes = text.as_bytes();
     let mut depth = 0i32;
-    for (i, c) in text[start..].char_indices() {
-        match c {
-            '{' => depth += 1,
-            '}' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(text[start..start + i + 1].to_string());
+    let mut in_string = false;
+    let mut i = start;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if in_string {
+            match c {
+                // Skip the escaped byte: a \" must not end the string.
+                b'\\' => {
+                    i += 2;
+                    continue;
                 }
+                b'"' => in_string = false,
+                _ => {}
             }
-            _ => {}
+        } else {
+            match c {
+                b'"' => in_string = true,
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Extracted::Found(text[start..=i].to_string());
+                    }
+                }
+                _ => {}
+            }
         }
+        i += 1;
     }
-    None
+    Extracted::Unbalanced
+}
+
+/// First ~500 chars of a model reply, single-line, for failure logs.
+/// A bad action must never again be reported without showing what the
+/// model actually returned — prose, malformed JSON, or a wrong scale
+/// (e.g. 0–100 coordinates where 0–1000 was asked) are all visible
+/// here. The same text is POSTed to the engine's /log/note.
+fn action_snippet(text: &str) -> String {
+    text.chars()
+        .take(500)
+        .collect::<String>()
+        .replace('\n', " ")
+        .replace('\r', "")
+}
+
+/// One-line detail for an executed pointer action: the monitor it ran
+/// on, normalized + logical coordinates, and that monitor's origin —
+/// plus the model's requested monitor when it differs, since a click
+/// routed to the wrong screen reports "ok" while doing nothing
+/// visible. This line is what separates a grounding error from a
+/// mapping error on the next failure.
+fn pointer_detail(
+    kind: &str,
+    target: &TargetMonitor,
+    model_monitor: u32,
+    x: f64,
+    y: f64,
+    px: f64,
+    py: f64,
+) -> String {
+    let mut s = format!(
+        "{} monitor {} x={} y={} px=({},{}) origin=({},{})",
+        kind, target.id, x, y, px, py, target.x, target.y
+    );
+    if model_monitor != target.id {
+        s.push_str(&format!(" [model said monitor {}]", model_monitor));
+    }
+    s
 }
 
 /// Convert normalized (0–1000) coordinates to a monitor's logical
@@ -425,18 +602,81 @@ fn normalized_to_pixels(x: f64, y: f64, width: f64, height: f64) -> (f64, f64) {
     )
 }
 
-fn prompt_for(task: &str) -> String {
+fn prompt_for(task: &str, monitor_id: u32, mon_w: f64, mon_h: f64) -> String {
     format!(
         "You are operating this Windows PC through screenshots. Task: {task}\n\
-        Reply with exactly one JSON object and nothing else, in this shape:\n\
+        This screenshot is monitor {monitor_id} ({mon_w}x{mon_h} logical pixels).\n\
+        Output ONLY a single JSON object. No prose, no markdown fences, no\n\
+        explanation, no apology, no trailing text. Start your reply with {{ and\n\
+        end with }}. Use exactly this shape:\n\
         {{\"action\": \"move\"|\"click\"|\"scroll\"|\"type\"|\"keys\"|\"done\", \
         \"monitor\": <id>, \"x\": <0-1000>, \"y\": <0-1000>, \"text\": \"...\", \
         \"keys\": [\"...\"], \"delta\": <scroll amount>, \"reason\": \"...\"}}\n\
         x and y are normalized 0-1000 across the screenshot (0,0 is the \
         top-left). Use \"done\" only when the task is complete, with a \
         short reason. Do one small step per reply; never claim done for \
-        a step you have not seen take effect."
+        a step you have not seen take effect. For system-level operations\n\
+        (opening Start, showing the desktop, switching windows), prefer a\n\
+        keys action (for example keys [\"win\"]) over grounding a click — a\n\
+        keypress is more reliable than a pixel target."
     )
+}
+
+/// One monitor's geometry as the operator needs it: id, virtual-desktop
+/// origin (physical px), LOGICAL dims (/monitors reports physical size
+/// + scale, while the engine API takes logical/DIP coordinates — using
+/// physical dims here used to double-scale on HiDPI monitors), scale,
+/// and the primary flag.
+struct TargetMonitor {
+    id: u32,
+    x: i32,
+    y: i32,
+    logical_w: f64,
+    logical_h: f64,
+    scale: f64,
+    is_primary: bool,
+}
+
+/// Pick the operator's target monitor: `--monitor <id>` wins, else the
+/// monitor flagged primary (never a fixed id — Windows enumeration
+/// order shifts between runs, which is why a v0.1.5 run logged monitor
+/// 0 and a v0.1.6 run monitor 1 for the same landscape panel), else
+/// the first monitor. Returns None when the wanted id is absent or
+/// there are no monitors at all.
+fn select_monitor(mons: &[Value], wanted: Option<u32>) -> Option<TargetMonitor> {
+    let read = |m: &Value| -> Option<TargetMonitor> {
+        let scale = m.get("scale").and_then(Value::as_f64).unwrap_or(1.0);
+        let scale = if scale > 0.0 { scale } else { 1.0 };
+        Some(TargetMonitor {
+            id: m.get("id").and_then(Value::as_f64)? as u32,
+            x: m.get("x").and_then(Value::as_f64)? as i32,
+            y: m.get("y").and_then(Value::as_f64)? as i32,
+            logical_w: m.get("width").and_then(Value::as_f64)? / scale,
+            logical_h: m.get("height").and_then(Value::as_f64)? / scale,
+            scale,
+            is_primary: m
+                .get("is_primary")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        })
+    };
+    if let Some(id) = wanted {
+        return mons.iter().find_map(|m| {
+            let t = read(m)?;
+            if t.id == id {
+                Some(t)
+            } else {
+                None
+            }
+        });
+    }
+    if let Some(m) = mons
+        .iter()
+        .find(|m| m.get("is_primary").and_then(Value::as_bool).unwrap_or(false))
+    {
+        return read(m);
+    }
+    mons.first().and_then(read)
 }
 
 // ---------------------------------------------------------------- main
@@ -531,43 +771,34 @@ fn run() -> Result<(), String> {
         .get("monitors")
         .and_then(Value::as_arr)
         .ok_or("/monitors reply has no monitors")?;
-    let pick = |id: u32| -> Option<(f64, f64, bool)> {
-        mons_arr.iter().find_map(|m| {
-            let mid = m.get("id").and_then(Value::as_f64)? as u32;
-            if mid == id {
-                Some((
-                    m.get("width").and_then(Value::as_f64).unwrap_or(0.0),
-                    m.get("height").and_then(Value::as_f64).unwrap_or(0.0),
-                    m.get("is_primary").and_then(Value::as_bool).unwrap_or(false),
-                ))
-            } else {
-                None
-            }
-        })
-    };
-    let (monitor_id, mon_w, mon_h) = match monitor_wanted {
-        Some(id) => {
-            let (w, h, _) = pick(id).ok_or_else(|| format!("no monitor {}", id))?;
-            (id, w, h)
-        }
+    let target = match select_monitor(mons_arr, monitor_wanted) {
+        Some(t) => t,
         None => {
-            let primary = mons_arr.iter().find(|m| {
-                m.get("is_primary").and_then(Value::as_bool).unwrap_or(false)
-            });
-            let m = primary.or_else(|| mons_arr.first()).ok_or("no monitors")?;
-            (
-                m.get("id").and_then(Value::as_f64).unwrap_or(0.0) as u32,
-                m.get("width").and_then(Value::as_f64).unwrap_or(0.0),
-                m.get("height").and_then(Value::as_f64).unwrap_or(0.0),
-            )
+            return Err(match monitor_wanted {
+                Some(id) => format!("no monitor {}", id),
+                None => "no monitors".to_string(),
+            })
         }
     };
+    let monitor_id = target.id;
+    let (mon_w, mon_h) = (target.logical_w, target.logical_h);
     println!(
-        "local-operator: task {:?} on monitor {} ({}x{}), model {}",
-        task, monitor_id, mon_w, mon_h, model
+        "local-operator: task {:?} on monitor {} at ({},{}) {}x{} logical, scale {:.2}, {}",
+        task,
+        target.id,
+        target.x,
+        target.y,
+        target.logical_w,
+        target.logical_h,
+        target.scale,
+        if target.is_primary {
+            "primary"
+        } else {
+            "not flagged primary"
+        }
     );
 
-    let prompt = prompt_for(&task);
+    let prompt = prompt_for(&task, monitor_id, mon_w, mon_h);
     let mut failures = 0u32;
     for step in 1..=max_steps {
         let (st, shot) = engine.get(&format!(
@@ -611,9 +842,81 @@ fn run() -> Result<(), String> {
         };
         let action = match parse_action(&content) {
             Ok(a) => a,
-            Err(e) => {
+            Err(ParseFail::Truncated(msg)) => {
+                // A truncated reply means the model never finished —
+                // retry the chat once on the same screenshot (the
+                // screen has not changed, since no action ran) instead
+                // of counting truncated garbage. Only the retry's
+                // outcome counts as a failure.
+                println!(
+                    "step {}: truncated action ({}), raw: {}, retrying chat once",
+                    step,
+                    msg,
+                    action_snippet(&content)
+                );
+                note_parse_failure(
+                    &engine,
+                    &format!("truncated action ({}): {}", msg, action_snippet(&content)),
+                );
+                match chat_step(&ollama_host, &model, &prompt, &shot) {
+                    Ok(c2) => match parse_action(&c2) {
+                        Ok(a) => a,
+                        Err(e2) => {
+                            failures += 1;
+                            println!(
+                                "step {}: still unparseable after retry ({}), raw: {}, failure {}",
+                                step,
+                                e2.message(),
+                                action_snippet(&c2),
+                                failures
+                            );
+                            note_parse_failure(
+                                &engine,
+                                &format!(
+                                    "unparseable action after retry ({}): {}",
+                                    e2.message(),
+                                    action_snippet(&c2)
+                                ),
+                            );
+                            if failures >= MAX_CONSECUTIVE_FAILURES {
+                                return Err(format!(
+                                    "{} consecutive unparseable actions",
+                                    failures
+                                ));
+                            }
+                            continue;
+                        }
+                    },
+                    Err(e2) => {
+                        failures += 1;
+                        println!(
+                            "step {}: chat retry failed ({}), failure {}",
+                            step, e2, failures
+                        );
+                        if failures >= MAX_CONSECUTIVE_FAILURES {
+                            return Err(format!("{} consecutive chat failures", failures));
+                        }
+                        continue;
+                    }
+                }
+            }
+            Err(ParseFail::Invalid(msg)) => {
                 failures += 1;
-                println!("step {}: unparseable action ({}), failure {}", step, e, failures);
+                println!(
+                    "step {}: unparseable action ({}), raw: {}, failure {}",
+                    step,
+                    msg,
+                    action_snippet(&content),
+                    failures
+                );
+                note_parse_failure(
+                    &engine,
+                    &format!(
+                        "unparseable action ({}): {}",
+                        msg,
+                        action_snippet(&content)
+                    ),
+                );
                 if failures >= MAX_CONSECUTIVE_FAILURES {
                     return Err(format!("{} consecutive unparseable actions", failures));
                 }
@@ -621,34 +924,58 @@ fn run() -> Result<(), String> {
             }
         };
         failures = 0;
-        let (label, result) = match &action {
+        let (detail, result) = match &action {
             Action::Move { monitor, x, y } => {
                 let (px, py) = normalized_to_pixels(*x, *y, mon_w, mon_h);
                 let body = format!(
                     "{{\"monitor\":{},\"x\":{},\"y\":{}}}",
-                    monitor, px, py
+                    monitor_id, px, py
                 );
-                ("move", engine.post_json("/input/move", &body))
+                (
+                    pointer_detail("move", &target, *monitor, *x, *y, px, py),
+                    engine.post_json("/input/move", &body),
+                )
             }
             Action::Click { monitor, x, y } => {
                 let (px, py) = normalized_to_pixels(*x, *y, mon_w, mon_h);
                 let body = format!(
                     "{{\"monitor\":{},\"x\":{},\"y\":{},\"button\":\"left\"}}",
-                    monitor, px, py
+                    monitor_id, px, py
                 );
-                ("click", engine.post_json("/input/click", &body))
+                (
+                    pointer_detail("click", &target, *monitor, *x, *y, px, py),
+                    engine.post_json("/input/click", &body),
+                )
             }
-            Action::Scroll { monitor, x, y, delta } => {
+            Action::Scroll {
+                monitor,
+                x,
+                y,
+                delta,
+            } => {
                 let (px, py) = normalized_to_pixels(*x, *y, mon_w, mon_h);
                 let body = format!(
                     "{{\"monitor\":{},\"x\":{},\"y\":{},\"delta\":{}}}",
-                    monitor, px, py, delta
+                    monitor_id, px, py, delta
                 );
-                ("scroll", engine.post_json("/input/scroll", &body))
+                (
+                    format!(
+                        "{} delta={}",
+                        pointer_detail("scroll", &target, *monitor, *x, *y, px, py),
+                        delta
+                    ),
+                    engine.post_json("/input/scroll", &body),
+                )
             }
             Action::Type { text } => {
                 let body = format!("{{\"text\":{}}}", json::quote(text));
-                ("type", engine.post_json("/input/type", &body))
+                (
+                    format!(
+                        "type {:?}",
+                        text.chars().take(200).collect::<String>()
+                    ),
+                    engine.post_json("/input/type", &body),
+                )
             }
             Action::Keys { keys } => {
                 let arr = keys
@@ -657,7 +984,10 @@ fn run() -> Result<(), String> {
                     .collect::<Vec<_>>()
                     .join(",");
                 let body = format!("{{\"keys\":[{}]}}", arr);
-                ("keys", engine.post_json("/input/keys", &body))
+                (
+                    format!("keys {:?}", keys),
+                    engine.post_json("/input/keys", &body),
+                )
             }
             Action::Done { reason } => {
                 println!("done: {}", reason);
@@ -666,19 +996,19 @@ fn run() -> Result<(), String> {
         };
         match result {
             Ok((st, _)) if (200..300).contains(&st) => {
-                println!("step {}: {} -> ok", step, label);
+                println!("step {}: {} -> ok", step, detail);
             }
             Ok((st, body)) => {
                 println!(
                     "step {}: {} -> engine HTTP {}: {}",
                     step,
-                    label,
+                    detail,
                     st,
                     String::from_utf8_lossy(&body).chars().take(200).collect::<String>()
                 );
             }
             Err(e) => {
-                println!("step {}: {} -> error: {}", step, label, e);
+                println!("step {}: {} -> error: {}", step, detail, e);
             }
         }
         std::thread::sleep(Duration::from_millis(STEP_DELAY_MS));
@@ -774,5 +1104,159 @@ mod tests {
         let s = snippet(body.as_bytes());
         assert_eq!(s.chars().count(), 200);
         assert!(!s.contains('\n'));
+    }
+
+    #[test]
+    fn action_parses_fences_anywhere_and_prose() {
+        // Fenced block mid-reply with prose on both sides.
+        let fenced = parse_action(
+            "Here is the next step:\n```json\n{\"action\":\"click\",\"x\":100,\"y\":200}\n```\nLet me know.",
+        )
+        .unwrap();
+        assert_eq!(
+            fenced,
+            Action::Click {
+                monitor: 0,
+                x: 100.0,
+                y: 200.0
+            }
+        );
+        // Bare prose before/after, no fences at all.
+        let prose = parse_action(
+            "Sure! {\"action\":\"keys\",\"keys\":[\"win\"]} Hope that helps.",
+        )
+        .unwrap();
+        assert_eq!(
+            prose,
+            Action::Keys {
+                keys: vec!["win".to_string()]
+            }
+        );
+        // Trailing text after the object, no fences.
+        let trailing =
+            parse_action("{\"action\":\"done\",\"reason\":\"open\"} all done!").unwrap();
+        assert_eq!(
+            trailing,
+            Action::Done {
+                reason: "open".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn action_parses_braces_inside_strings() {
+        // The old brace counter broke on braces inside string values.
+        let a = parse_action(
+            r#"{"action":"type","text":"hello {world} and {friends}"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            a,
+            Action::Type {
+                text: "hello {world} and {friends}".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn action_distinguishes_truncated_from_malformed() {
+        // Cut off mid-object: unbalanced braces -> Truncated.
+        assert_eq!(
+            parse_action("{\"action\":\"click\",\"x\":500,").unwrap_err(),
+            ParseFail::Truncated(
+                "model reply ends mid-object (unbalanced braces)".to_string()
+            )
+        );
+        // Complete object, bad JSON: trailing comma -> Invalid.
+        assert!(matches!(
+            parse_action("{\"action\":\"click\",\"x\":500,}").unwrap_err(),
+            ParseFail::Invalid(_)
+        ));
+        // Complete object, unquoted key -> Invalid.
+        assert!(matches!(
+            parse_action("{action:\"click\"}").unwrap_err(),
+            ParseFail::Invalid(_)
+        ));
+        // No object at all (prose reply) -> Invalid, not Truncated.
+        assert!(matches!(
+            parse_action("I can see the Start button.").unwrap_err(),
+            ParseFail::Invalid(_)
+        ));
+    }
+
+    #[test]
+    fn action_validation_rules() {
+        // Pointer actions need numeric x and y.
+        assert!(parse_action(r#"{"action":"click","x":500}"#).is_err());
+        assert!(parse_action(r#"{"action":"click","x":"500","y":100}"#).is_err());
+        // Out-of-range coordinates clamp to 0–1000, they do not fail.
+        let clamped = parse_action(r#"{"action":"move","x":1500,"y":-20}"#).unwrap();
+        assert_eq!(
+            clamped,
+            Action::Move {
+                monitor: 0,
+                x: 1000.0,
+                y: 0.0
+            }
+        );
+        // type/keys need non-empty payloads.
+        assert!(parse_action(r#"{"action":"type","text":""}"#).is_err());
+        assert!(parse_action(r#"{"action":"type"}"#).is_err());
+        assert!(parse_action(r#"{"action":"keys","keys":[]}"#).is_err());
+        assert!(parse_action(r#"{"action":"keys","keys":["win",7]}"#).is_err());
+        // Monitor must be numeric when present.
+        assert!(parse_action(r#"{"action":"click","monitor":"1","x":1,"y":1}"#).is_err());
+    }
+
+    #[test]
+    fn action_snippet_truncates_to_500_and_flattens() {
+        let long = format!("{}\nsecond line", "b".repeat(600));
+        let s = action_snippet(&long);
+        assert_eq!(s.chars().count(), 500);
+        assert!(!s.contains('\n'));
+    }
+
+    #[test]
+    fn select_monitor_prefers_primary_flag_not_id_order() {
+        let portrait = json::parse(
+            r#"{"id":0,"x":2560,"y":-556,"width":2160,"height":3840,"scale":1.5,"is_primary":false}"#,
+        )
+        .unwrap();
+        let landscape = json::parse(
+            r#"{"id":1,"x":0,"y":0,"width":2560,"height":1440,"scale":1.0,"is_primary":true}"#,
+        )
+        .unwrap();
+        // Primary wins even when it is not first in the list.
+        let t = select_monitor(&[portrait.clone(), landscape.clone()], None).unwrap();
+        assert_eq!(t.id, 1);
+        assert_eq!((t.x, t.y), (0, 0));
+        assert_eq!((t.logical_w, t.logical_h), (2560.0, 1440.0));
+        assert!(t.is_primary);
+        // No primary flagged -> first monitor.
+        let plain = json::parse(
+            r#"{"id":5,"x":0,"y":0,"width":1920,"height":1080,"scale":1.0,"is_primary":false}"#,
+        )
+        .unwrap();
+        let t = select_monitor(&[plain], None).unwrap();
+        assert_eq!(t.id, 5);
+        assert!(!t.is_primary);
+        // --monitor picks by id; unknown id -> None.
+        let t =
+            select_monitor(&[portrait.clone(), landscape.clone()], Some(0)).unwrap();
+        assert_eq!(t.id, 0);
+        // Logical dims divide physical size by scale (no double-scaling).
+        assert_eq!((t.logical_w, t.logical_h), (1440.0, 2560.0));
+        assert_eq!(t.scale, 1.5);
+        assert!(select_monitor(&[portrait, landscape], Some(9)).is_none());
+        assert!(select_monitor(&[], None).is_none());
+    }
+
+    #[test]
+    fn prompt_forbids_prose_and_prefers_keys_for_system_ops() {
+        let p = prompt_for("Open start menu", 1, 2560.0, 1440.0);
+        assert!(p.contains("ONLY a single JSON object"));
+        assert!(p.contains("no markdown fences"));
+        assert!(p.contains("monitor 1"));
+        assert!(p.contains("keys [\"win\"]"));
     }
 }
